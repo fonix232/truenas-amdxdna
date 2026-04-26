@@ -47,7 +47,7 @@ jobs:
 
   build:
     needs: prepare-matrix
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -61,16 +61,25 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
+          # Match TrueNAS CI package list (ubuntu-22.04) exactly so that
+          # make syncconfig sees the same host tools and produces the same
+          # autoconf.h as the production TrueNAS kernel build.
+          # dwarves (pahole) is required for CONFIG_DEBUG_INFO_BTF=y which
+          # gates struct module fields; without it syncconfig disables BTF
+          # and changes struct module layout.
           sudo apt-get install -y --no-install-recommends \
-            bc bison clang flex gcc git kmod \
-            libelf-dev libssl-dev llvm make rsync \
-            squashfs-tools tar xz-utils
+            bc bison build-essential dwarves flex gawk git kmod \
+            libcap-dev libelf-dev liblzma-dev libssl-dev \
+            make python3-dev rsync squashfs-tools tar xz-utils
 
-      - name: Install Rust toolchain (must match TrueNAS kernel build)
+      - name: Install Rust toolchain
         run: |
-          # debian_amd64.config requires CONFIG_RUSTC_VERSION=109101 (1.91.1)
-          # and bindgen 0.72.1. Without the exact versions, make syncconfig
-          # silently sets CONFIG_RUST=n, causing struct layout mismatches.
+          # The production TrueNAS kernel was built with CONFIG_RUST=y.
+          # debian_amd64.config embeds RUSTC_VERSION=109101 (rustc 1.91.1)
+          # and bindgen 0.72.1. make syncconfig validates installed versions
+          # against these values; if they don't match it silently sets
+          # CONFIG_RUST=n, which changes struct layouts and causes the
+          # 'existing value is nonzero' relocation error at modprobe time.
           rustup toolchain install 1.91.1-x86_64-unknown-linux-gnu --profile minimal
           rustup default 1.91.1-x86_64-unknown-linux-gnu
           rustup component add rust-src
@@ -82,7 +91,7 @@ jobs:
         with:
           path: kernel-src
           # Cache is per-tag + mode because debug/production have different configs
-          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v8
+          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v10
 
       - name: Fetch and prepare kernel headers
         if: steps.cache-kernel.outputs.cache-hit != 'true'
