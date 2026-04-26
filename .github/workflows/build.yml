@@ -1,0 +1,123 @@
+name: Build amdxdna sysext
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      single_version:
+        description: "Build only this TrueNAS tag (e.g. TS-26.0.0-BETA.1). Leave blank for all."
+        required: false
+        default: ""
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build matrix from kernels.json
+        id: set
+        env:
+          SINGLE_VERSION: ${{ inputs.single_version }}
+        run: |
+          # Expand each kernel entry into one job per mode, computing the full kernel release string.
+          expanded=$(jq -c '[
+            .[] | . as $e |
+            (if $e.modes then $e.modes else ["production"] end)[] | . as $mode |
+            {
+              base_version: $e.base_version,
+              truenas_tag:  $e.truenas_tag,
+              mode:         $mode,
+              kernel_version: ($e.base_version + "-" + $mode + "+truenas"),
+              dkms_ref:     ($e.dkms_ref // "main")
+            }
+          ]' kernels.json)
+          if [[ -n "${SINGLE_VERSION}" ]]; then
+            matrix=$(echo "${expanded}" | jq -c --arg v "${SINGLE_VERSION}" '[.[] | select(.truenas_tag == $v)]')
+            [[ "$(echo "${matrix}" | jq 'length')" -gt 0 ]] \
+              || { echo "ERROR: '${SINGLE_VERSION}' not found in kernels.json" >&2; exit 1; }
+          else
+            matrix="${expanded}"
+          fi
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare-matrix
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+
+    name: "sysext / ${{ matrix.truenas_tag }} / ${{ matrix.mode }}"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison dkms flex gcc git kmod \
+            libelf-dev libssl-dev make rsync \
+            squashfs-tools tar xz-utils
+
+      - name: Cache prepared kernel headers
+        id: cache-kernel
+        uses: actions/cache@v4
+        with:
+          path: kernel-src
+          # Cache is per-tag + mode because debug/production may have different configs
+          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v1
+
+      - name: Fetch and prepare kernel headers
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        env:
+          KERNEL_SOURCE_REF: ${{ matrix.truenas_tag }}
+          BUILD_MODE: ${{ matrix.mode }}
+        run: |
+          git clone --depth 1 --branch "${KERNEL_SOURCE_REF}" \
+            https://github.com/truenas/linux kernel-src
+          cd kernel-src
+          # Use the appropriate defconfig for the target mode
+          if [[ "${BUILD_MODE}" == "debug" ]]; then
+            make defconfig
+            ./scripts/config --enable DEBUG_INFO --enable KASAN || true
+          else
+            make defconfig
+          fi
+          make -j$(nproc) scripts prepare modules_prepare
+
+      - name: Build sysext bundle
+        env:
+          KERNEL_VERSION: ${{ matrix.kernel_version }}
+          KERNEL_HEADERS_DIR: ${{ github.workspace }}/kernel-src
+          AMDXDNA_REF: ${{ matrix.dkms_ref }}
+          WORK_ROOT: ${{ github.workspace }}/work
+          OUT_DIR: ${{ github.workspace }}/out
+          BUILD_RUN_ID: ${{ github.run_id }}
+          BUILD_SHA: ${{ github.sha }}
+          INSTALLER_TEMPLATE: ${{ github.workspace }}/builder/installer-template.sh
+        run: |
+          mkdir -p "${WORK_ROOT}" "${OUT_DIR}"
+          chmod +x builder/build.sh
+          builder/build.sh
+
+      - name: Sanitize artifact name
+        id: artifact-name
+        env:
+          KERNEL_VERSION: ${{ matrix.kernel_version }}
+        run: |
+          safe="$(printf '%s' "${KERNEL_VERSION}" | tr '+/' '__')"
+          echo "name=amdxdna-sysext-${safe}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload sysext artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: out/
+          retention-days: 30

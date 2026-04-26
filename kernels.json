@@ -1,0 +1,7 @@
+[
+  {
+    "base_version": "6.18.13",
+    "truenas_tag": "TS-26.0.0-BETA.1",
+    "modes": ["production"]
+  }
+]
