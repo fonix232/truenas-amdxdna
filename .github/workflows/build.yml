@@ -62,9 +62,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison flex gcc git kmod \
-            libelf-dev libssl-dev make rsync \
+            bc bison clang flex gcc git kmod \
+            libelf-dev libssl-dev llvm make rsync \
             squashfs-tools tar xz-utils
+
+      - name: Install Rust toolchain (must match TrueNAS kernel build)
+        run: |
+          # debian_amd64.config requires CONFIG_RUSTC_VERSION=109101 (1.91.1)
+          # and bindgen 0.72.1. Without the exact versions, make syncconfig
+          # silently sets CONFIG_RUST=n, causing struct layout mismatches.
+          rustup toolchain install 1.91.1-x86_64-unknown-linux-gnu --profile minimal
+          rustup default 1.91.1-x86_64-unknown-linux-gnu
+          rustup component add rust-src
+          cargo install --locked bindgen-cli --version 0.72.1
 
       - name: Cache prepared kernel headers
         id: cache-kernel
@@ -72,7 +82,7 @@ jobs:
         with:
           path: kernel-src
           # Cache is per-tag + mode because debug/production have different configs
-          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v7
+          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v8
 
       - name: Fetch and prepare kernel headers
         if: steps.cache-kernel.outputs.cache-hit != 'true'
