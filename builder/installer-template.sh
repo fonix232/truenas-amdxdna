@@ -74,8 +74,10 @@ main() {
 
   _cleanup() {
     # Always re-lock /usr on exit, even if an error occurred mid-install.
-    zfs set readonly=on "${usr_ds}" 2>/dev/null || true
-    rm -rf "${tmp_dir}"
+    # Guard against being called from the EXIT trap after main() has already
+    # returned (at which point local variables are no longer in scope).
+    [[ -n "${usr_ds:-}" ]] && zfs set readonly=on "${usr_ds}" 2>/dev/null || true
+    [[ -n "${tmp_dir:-}" ]] && rm -rf "${tmp_dir}"
   }
   trap '_cleanup' EXIT
 
@@ -92,7 +94,7 @@ main() {
 
   # If extensions are currently merged, unmerge first.
   # systemd-sysext sets its own overlay on /usr; we must unmerge before writing.
-  if systemd-sysext status 2>/dev/null | awk 'NR>1 && $2 != "none" {found=1} END {exit !found}'; then
+  if systemd-sysext status 2>/dev/null | awk 'NR>1 && $2 != "none" {found=1} END {exit !found}' > /dev/null 2>&1; then
     systemd-sysext unmerge || true
   fi
 
@@ -132,3 +134,6 @@ main() {
 }
 
 main "$@"
+# Exit explicitly so bash does not attempt to read/execute the binary payload
+# that is appended after this line by the build script.
+exit 0
