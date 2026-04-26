@@ -72,7 +72,7 @@ jobs:
         with:
           path: kernel-src
           # Cache is per-tag + mode because debug/production may have different configs
-          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v2
+          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v3
 
       - name: Fetch and prepare kernel headers
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -93,12 +93,20 @@ jobs:
           # Enable DRM/ACCEL so that configure_kernel.sh can correctly probe
           # DRM API availability — without these, the probe compilations fail
           # silently and the compat shims conflict with the kernel's own defs.
+          # Set LOCALVERSION=+truenas and disable LOCALVERSION_AUTO so the
+          # KERNELRELEASE (and module vermagic) is exactly
+          # "6.18.13-production+truenas" — matching uname -r on TrueNAS.
+          # Without this, scripts/setlocalversion appends the git short hash
+          # (e.g. -g47dcd973366f), producing a vermagic mismatch that causes
+          # modprobe to fail with ENOEXEC / "Exec format error".
           ./scripts/config \
             --enable DRM \
             --enable DRM_ACCEL \
             --enable PCI \
             --enable IOMMU_SUPPORT \
-            --enable AMD_IOMMU
+            --enable AMD_IOMMU \
+            --set-str LOCALVERSION "+truenas" \
+            --disable LOCALVERSION_AUTO
           make -j$(nproc) scripts prepare modules_prepare
 
       - name: Build sysext bundle
