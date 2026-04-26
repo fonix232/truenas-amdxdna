@@ -32,19 +32,6 @@ need_cmd() {
   command -v "${cmd}" >/dev/null 2>&1 || die "missing command: ${cmd}"
 }
 
-parse_dkms_var() {
-  local var="$1"
-  local file="$2"
-  awk -F '=' -v name="${var}" '
-    $1 ~ "^"name"(\[[0-9]+\])?$" {
-      gsub(/^[ \t]+|[ \t]+$/, "", $2)
-      gsub(/\"/, "", $2)
-      print $2
-      exit
-    }
-  ' "${file}"
-}
-
 prepare() {
   rm -rf "${WORK_ROOT}"
   mkdir -p "${SRC_DIR}" "${PAYLOAD_DIR}/module" "${PAYLOAD_DIR}/firmware" "${OUT_DIR}"
@@ -80,35 +67,47 @@ fetch_linux_firmware() {
 
 build_dkms_module() {
   local src="${SRC_DIR}/amdxdna-dkms"
-  local pkg_name
-  local pkg_ver
-  local module_path=""
+  local drv_src="${src}/drivers/accel/amdxdna"
+  local configure_script="${src}/drivers/accel/tools/configure_kernel.sh"
+  local config_hdr="${drv_src}/config_kernel.h"
 
-  log "cloning DKMS source: ${DKMS_REPO} (${AMDXDNA_REF})"
+  log "cloning driver source: ${DKMS_REPO} (${AMDXDNA_REF})"
   git clone --depth 1 --branch "${AMDXDNA_REF}" "${DKMS_REPO}" "${src}" || \
     git clone --depth 1 "${DKMS_REPO}" "${src}"
 
   [[ -d "${KERNEL_HEADERS_DIR}" ]] || die "KERNEL_HEADERS_DIR not found: ${KERNEL_HEADERS_DIR}"
-  [[ -f "${src}/dkms.conf" ]] || die "dkms.conf not found in DKMS repo"
+  [[ -d "${drv_src}" ]]            || die "driver source not found: ${drv_src}"
+  [[ -f "${configure_script}" ]]   || die "configure_kernel.sh not found: ${configure_script}"
 
-  pkg_name="$(parse_dkms_var PACKAGE_NAME "${src}/dkms.conf")"
-  pkg_ver="$(parse_dkms_var PACKAGE_VERSION "${src}/dkms.conf")"
-  [[ -n "${pkg_name}" ]] || pkg_name="amdxdna"
-  [[ -n "${pkg_ver}" ]] || pkg_ver="0.0.0+local"
+  # Generate config_kernel.h by feature-testing the target kernel headers.
+  # The script uses KERNEL_SRC (headers tree), KERNEL_VER (for cache key),
+  # and OUT (absolute path to write the header).
+  log "generating config_kernel.h against ${KERNEL_HEADERS_DIR}"
+  KERNEL_SRC="${KERNEL_HEADERS_DIR}" \
+    KERNEL_VER="${KERNEL_VERSION}" \
+    OUT="${config_hdr}" \
+    bash "${configure_script}"
+  [[ -f "${config_hdr}" ]] || die "config_kernel.h was not generated"
 
-  dkms add -m "${pkg_name}" -v "${pkg_ver}" --sourcetree "${src}" || true
-  dkms build -m "${pkg_name}" -v "${pkg_ver}" -k "${KERNEL_VERSION}" --kernelsourcedir "${KERNEL_HEADERS_DIR}"
+  # Build the out-of-tree module directly using the kernel build system.
+  # OFT_CONFIG_AMDXDNA_PCI=y selects the PCIe driver objects (Kbuild flag).
+  log "building amdxdna.ko against kernel ${KERNEL_VERSION}"
+  make -C "${KERNEL_HEADERS_DIR}" \
+    M="${drv_src}" \
+    CFLAGS_MODULE="-DAMDXDNA_DEVEL" \
+    OFT_CONFIG_AMDXDNA_PCI=y \
+    modules
 
-  module_path="$(find /var/lib/dkms/${pkg_name}/${pkg_ver} -type f -name amdxdna.ko | grep "/${KERNEL_VERSION}/" | head -n1 || true)"
-  if [[ -z "${module_path}" ]]; then
-    module_path="$(find /var/lib/dkms/${pkg_name}/${pkg_ver} -type f -name amdxdna.ko | head -n1 || true)"
-  fi
-  [[ -n "${module_path}" ]] || die "could not locate built amdxdna.ko"
+  local ko="${drv_src}/amdxdna.ko"
+  [[ -f "${ko}" ]] || die "could not locate built amdxdna.ko under ${drv_src}"
 
-  install -m 0644 "${module_path}" "${PAYLOAD_DIR}/module/amdxdna.ko"
+  install -m 0644 "${ko}" "${PAYLOAD_DIR}/module/amdxdna.ko"
 
   git -C "${src}" rev-parse HEAD > "${PAYLOAD_DIR}/dkms.commit"
-  printf '%s\n' "${pkg_name}" > "${PAYLOAD_DIR}/dkms.package"
+  # Parse version from the Makefile XDNA_DRIVER_VERSION variable
+  local pkg_ver
+  pkg_ver="$(grep -m1 'XDNA_DRIVER_VERSION' "${drv_src}/Makefile" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || echo '0.0.0')"
+  printf 'amdxdna\n'      > "${PAYLOAD_DIR}/dkms.package"
   printf '%s\n' "${pkg_ver}" > "${PAYLOAD_DIR}/dkms.version"
 }
 
@@ -195,7 +194,7 @@ assemble_sysext() {
 
 main() {
   need_cmd git
-  need_cmd dkms
+  need_cmd make
   need_cmd dpkg-deb
   need_cmd mksquashfs
   need_cmd rsync

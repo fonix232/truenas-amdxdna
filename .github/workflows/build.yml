@@ -62,7 +62,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison dkms flex gcc git kmod \
+            bc bison flex gcc git kmod \
             libelf-dev libssl-dev make rsync \
             squashfs-tools tar xz-utils
 
