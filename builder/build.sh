@@ -83,8 +83,15 @@ build_dkms_module() {
   # The script uses KERNEL_SRC (headers tree), KERNEL_VER (for cache key),
   # and OUT (absolute path to write the header).
   log "generating config_kernel.h against ${KERNEL_HEADERS_DIR}"
+  # KBUILD_MODPOST_WARN=1: the headers tree has no Module.symvers (we only ran
+  # modules_prepare, not a full build). Without this, modpost exits non-zero
+  # for any probe that references an exported symbol (e.g. drm_fdinfo_print_size),
+  # causing configure_kernel.sh to falsely report the feature absent and emit a
+  # compat macro that then conflicts with the kernel's own definition.
   KERNEL_SRC="${KERNEL_HEADERS_DIR}" \
     KERNEL_VER="${KERNEL_VERSION}" \
+    KBUILD_MODPOST_WARN=1 \
+    KCFLAGS="-Wno-unused-variable" \
     OUT="${config_hdr}" \
     bash "${configure_script}"
   [[ -f "${config_hdr}" ]] || die "config_kernel.h was not generated"
@@ -92,7 +99,9 @@ build_dkms_module() {
   # Build the out-of-tree module directly using the kernel build system.
   # OFT_CONFIG_AMDXDNA_PCI=y selects the PCIe driver objects (Kbuild flag).
   log "building amdxdna.ko against kernel ${KERNEL_VERSION}"
-  make -C "${KERNEL_HEADERS_DIR}" \
+  # KBUILD_MODPOST_WARN=1: same reason as above — no Module.symvers in the
+  # headers-only tree; treat undefined DRM symbol references as warnings.
+  KBUILD_MODPOST_WARN=1 make -C "${KERNEL_HEADERS_DIR}" \
     M="${drv_src}" \
     CFLAGS_MODULE="-DAMDXDNA_DEVEL" \
     OFT_CONFIG_AMDXDNA_PCI=y \
