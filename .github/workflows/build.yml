@@ -71,8 +71,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: kernel-src
-          # Cache is per-tag + mode because debug/production may have different configs
-          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v5
+          # Cache is per-tag + mode because debug/production have different configs
+          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v7
 
       - name: Fetch and prepare kernel headers
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -83,34 +83,33 @@ jobs:
           git -c init.defaultBranch=main clone --depth 1 --branch "${KERNEL_SOURCE_REF}" \
             https://github.com/truenas/linux kernel-src
           # Remove .git so scripts/setlocalversion cannot detect a dirty tree
-          # and append a trailing '+' to KERNELRELEASE. Without .git present,
-          # only LOCALVERSION (set below) is appended to the base version.
-          rm -rf kernel-src/.git
+          # and append a trailing '+' to KERNELRELEASE.
+          rm -rf kernel-src/.git kernel-src/.gitattributes kernel-src/.gitignore
           cd kernel-src
-          # Use the appropriate defconfig for the target mode
+          # Replicate TrueNAS's exact kernel config sequence so that CONFIG-gated
+          # kernel data structures (including struct module) match the running kernel
+          # exactly.  Using defconfig alone causes a struct module size mismatch that
+          # makes modprobe fail with "section size must match" even when vermagic is
+          # correct.  The three overlay files are the same ones used by TrueNAS CI.
+          make ARCH=x86_64 defconfig
+          ./scripts/kconfig/merge_config.sh .config \
+            scripts/package/truenas/debian_amd64.config
+          ./scripts/kconfig/merge_config.sh .config \
+            scripts/package/truenas/truenas.config
           if [[ "${BUILD_MODE}" == "debug" ]]; then
-            make defconfig
-            ./scripts/config --enable DEBUG_INFO --enable KASAN || true
+            ./scripts/kconfig/merge_config.sh .config \
+              scripts/package/truenas/tn-debug.config 2>/dev/null || \
+            ./scripts/kconfig/merge_config.sh .config \
+              scripts/package/truenas/tn-production.config
           else
-            make defconfig
+            ./scripts/kconfig/merge_config.sh .config \
+              scripts/package/truenas/tn-production.config
           fi
-          # Enable DRM/ACCEL so that configure_kernel.sh can correctly probe
-          # DRM API availability — without these, the probe compilations fail
-          # silently and the compat shims conflict with the kernel's own defs.
-          # Set LOCALVERSION=+truenas and disable LOCALVERSION_AUTO so the
-          # KERNELRELEASE (and module vermagic) is exactly
-          # "6.18.13-production+truenas" — matching uname -r on TrueNAS.
-          # Without this, scripts/setlocalversion appends the git short hash
-          # (e.g. -g47dcd973366f), producing a vermagic mismatch that causes
-          # modprobe to fail with ENOEXEC / "Exec format error".
-          ./scripts/config \
-            --enable DRM \
-            --enable DRM_ACCEL \
-            --enable PCI \
-            --enable IOMMU_SUPPORT \
-            --enable AMD_IOMMU \
-            --set-str LOCALVERSION "+truenas" \
-            --disable LOCALVERSION_AUTO
+          # truenas.config points SYSTEM_TRUSTED_KEYS at debian/certs/ which is not
+          # present in a shallow clone.  Clear it; the cert bundle is not needed for
+          # modules_prepare and does not affect the compiled struct layout.
+          ./scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
+          make syncconfig
           make -j$(nproc) scripts prepare modules_prepare
 
       - name: Build sysext bundle
