@@ -94,8 +94,10 @@ main() {
 
   # If extensions are currently merged, unmerge first.
   # systemd-sysext sets its own overlay on /usr; we must unmerge before writing.
-  if systemd-sysext status 2>/dev/null | awk 'NR>1 && $2 != "none" {found=1} END {exit !found}' > /dev/null 2>&1; then
-    systemd-sysext unmerge || true
+  # --extension-dir tells systemd-sysext to search the TrueNAS custom path
+  # (not a default search directory).
+  if systemd-sysext --extension-dir="${SYSEXT_DIR}" status 2>/dev/null | awk 'NR>1 && $2 != "none" {found=1} END {exit !found}' > /dev/null 2>&1; then
+    systemd-sysext --extension-dir="${SYSEXT_DIR}" unmerge || true
   fi
 
   install -m 0644 "${tmp_dir}/payload/${module_raw}"   "${SYSEXT_DIR}/${module_raw}"
@@ -105,8 +107,11 @@ main() {
   # The trap will also do this on any error path.
   zfs set readonly=on "${usr_ds}"
 
-  # Merge all extensions including the newly placed ones
-  systemd-sysext merge
+  # Merge all extensions including the newly placed ones.
+  # --extension-dir is required: /usr/share/truenas/sysext-extensions/ is not
+  # in systemd-sysext's default search path (/etc/extensions/, /run/extensions/,
+  # /var/lib/extensions/, /usr/lib/extensions/, /usr/local/lib/extensions/).
+  systemd-sysext --extension-dir="${SYSEXT_DIR}" merge
 
   if [[ "${RELOAD_MODULE}" == "1" ]]; then
     depmod -a "${EMBEDDED_KREL}" 2>/dev/null || true
@@ -124,7 +129,7 @@ main() {
   echo "NOTE: after a TrueNAS system update, re-run this installer to restore"
   echo "      extensions in the new boot environment."
   echo
-  systemd-sysext status
+  systemd-sysext --extension-dir="${SYSEXT_DIR}" status
 
   if [[ -f "${tmp_dir}/payload/metadata.env" ]]; then
     echo
