@@ -72,7 +72,7 @@ jobs:
         with:
           path: kernel-src
           # Cache is per-tag + mode because debug/production may have different configs
-          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v4
+          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v5
 
       - name: Fetch and prepare kernel headers
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -82,13 +82,10 @@ jobs:
         run: |
           git -c init.defaultBranch=main clone --depth 1 --branch "${KERNEL_SOURCE_REF}" \
             https://github.com/truenas/linux kernel-src
-          # Create .scmversion so scripts/setlocalversion reads it directly
-          # instead of running git commands. Without this, modifying .config
-          # via scripts/config makes the tree dirty, causing setlocalversion
-          # to append a trailing '+' even with LOCALVERSION_AUTO=n, producing
-          # vermagic '6.18.13-production+truenas+' instead of the expected
-          # '6.18.13-production+truenas'.
-          printf '' > kernel-src/.scmversion
+          # Remove .git so scripts/setlocalversion cannot detect a dirty tree
+          # and append a trailing '+' to KERNELRELEASE. Without .git present,
+          # only LOCALVERSION (set below) is appended to the base version.
+          rm -rf kernel-src/.git
           cd kernel-src
           # Use the appropriate defconfig for the target mode
           if [[ "${BUILD_MODE}" == "debug" ]]; then
