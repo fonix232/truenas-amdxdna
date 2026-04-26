@@ -72,7 +72,7 @@ jobs:
         with:
           path: kernel-src
           # Cache is per-tag + mode because debug/production may have different configs
-          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v1
+          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v2
 
       - name: Fetch and prepare kernel headers
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -90,6 +90,15 @@ jobs:
           else
             make defconfig
           fi
+          # Enable DRM/ACCEL so that configure_kernel.sh can correctly probe
+          # DRM API availability — without these, the probe compilations fail
+          # silently and the compat shims conflict with the kernel's own defs.
+          ./scripts/config \
+            --enable DRM \
+            --enable DRM_ACCEL \
+            --enable PCI \
+            --enable IOMMU_SUPPORT \
+            --enable AMD_IOMMU
           make -j$(nproc) scripts prepare modules_prepare
 
       - name: Build sysext bundle
