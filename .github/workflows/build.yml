@@ -11,6 +11,11 @@ on:
         required: false
         default: ""
 
+env:
+  # Opt into Node.js 24 for all actions (checkout, cache, upload-artifact).
+  # Node.js 20 support is being removed from GHA runners on 2026-09-16.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   prepare-matrix:
     runs-on: ubuntu-24.04
@@ -80,7 +85,7 @@ jobs:
           KERNEL_SOURCE_REF: ${{ matrix.truenas_tag }}
           BUILD_MODE: ${{ matrix.mode }}
         run: |
-          git clone --depth 1 --branch "${KERNEL_SOURCE_REF}" \
+          git -c init.defaultBranch=main clone --depth 1 --branch "${KERNEL_SOURCE_REF}" \
             https://github.com/truenas/linux kernel-src
           cd kernel-src
           # Use the appropriate defconfig for the target mode
