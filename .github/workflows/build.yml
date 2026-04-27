@@ -45,8 +45,27 @@ jobs:
   # ---------------------------------------------------------------------------
   build-firmware:
     runs-on: ubuntu-24.04
+    outputs:
+      fw_commit: ${{ steps.head.outputs.fw_commit }}
     steps:
-      - name: Fetch amdnpu firmware from upstream linux-firmware git
+      - name: Get linux-firmware HEAD commit
+        id: head
+        run: |
+          fw_commit="$(git ls-remote \
+            https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git \
+            HEAD | cut -f1)"
+          echo "linux-firmware HEAD: ${fw_commit}"
+          echo "fw_commit=${fw_commit}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore firmware cache
+        id: cache
+        uses: actions/cache/restore@v5
+        with:
+          path: amdnpu-firmware
+          key: amdxdna-firmware-${{ steps.head.outputs.fw_commit }}
+
+      - name: Fetch and assemble amdnpu firmware
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p amdnpu-firmware
           git clone --depth 1 \
@@ -63,13 +82,10 @@ jobs:
           find amdnpu-firmware -mindepth 1 -maxdepth 1 -type d | while read -r dir; do
             mapfile -t candidates < <(find "${dir}" -maxdepth 1 -name 'npu.sbin.*' | sort -V)
             if [[ ${#candidates[@]} -eq 0 ]]; then
-              echo "WARNING: no versioned npu.sbin.* found in ${dir}" >&2
-              continue
+              echo "WARNING: no versioned npu.sbin.* found in ${dir}" >&2; continue
             fi
-            echo "  ${dir}: candidates (version-sorted):"
-            for f in "${candidates[@]}"; do echo "    $(basename "${f}")"; done
+            echo "  ${dir}: candidates: ${candidates[*]##*/}"
             latest="${candidates[-1]}"
-            echo "  ${dir}: selecting $(basename "${latest}") as latest"
             ln -sf "$(basename "${latest}")" "${dir}/npu.sbin"
             echo "  ${dir}: npu.sbin -> $(readlink "${dir}/npu.sbin")"
           done
@@ -79,11 +95,12 @@ jobs:
             xargs -I{} sh -c 'if [ -L "{}" ]; then echo "  L {}  ->  $(readlink {})"; else echo "  F {}"; fi'
           echo "-----------------------------"
 
-      - uses: actions/upload-artifact@v7
+      - name: Save firmware cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
         with:
-          name: amdxdna-firmware-files
-          path: amdnpu-firmware/
-          retention-days: 7
+          path: amdnpu-firmware
+          key: amdxdna-firmware-${{ steps.head.outputs.fw_commit }}
 
   # ---------------------------------------------------------------------------
   # Job 3: prepare-headers
@@ -244,10 +261,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends rsync squashfs-tools tar
 
-      - uses: actions/download-artifact@v8
+      - name: Restore firmware from cache
+        uses: actions/cache/restore@v5
         with:
-          name: amdxdna-firmware-files
           path: amdnpu-firmware
+          key: amdxdna-firmware-${{ needs.build-firmware.outputs.fw_commit }}
+          fail-on-cache-miss: true
 
       # Downloads all amdxdna-ko-* artifacts, each into its own subdirectory
       # named after the artifact (e.g. amdxdna-ko-TS-26.0.0-BETA.1-production/)
@@ -272,6 +291,7 @@ jobs:
           mkdir -p "${fw_tree}/usr/lib/firmware/amdnpu" \
                    "${fw_tree}/usr/lib/extension-release.d"
           rsync -a amdnpu-firmware/ "${fw_tree}/usr/lib/firmware/amdnpu/"
+
           printf 'ID=_any\nSYSEXT_SCOPE=system\nARCHITECTURE=x86-64\n' \
             > "${fw_tree}/usr/lib/extension-release.d/extension-release.${firmware_name}"
           mksquashfs "${fw_tree}" "work/${firmware_name}.raw" -comp xz -noappend -quiet
