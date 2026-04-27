@@ -42,7 +42,12 @@ jobs:
         id: check
         run: |
           tag="${{ steps.upstream.outputs.tag }}"
-          if docker manifest inspect "ghcr.io/fonix232/fastflowlm:${tag}" > /dev/null 2>&1; then
+          # Always rebuild when triggered by a Dockerfile change,
+          # even if the versioned tag already exists.
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Dockerfile changed — forcing rebuild"
+          elif docker manifest inspect "ghcr.io/fonix232/fastflowlm:${tag}" > /dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "Image ghcr.io/fonix232/fastflowlm:${tag} already exists — skipping build"
           else

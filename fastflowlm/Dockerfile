@@ -150,5 +150,9 @@ RUN mkdir -p /root/.config/flm
 
 ENV FLM_XCLBIN_PATH=/opt/fastflowlm/share/flm/xclbins
 
-ENTRYPOINT ["flm"]
-CMD ["serve"]
+# Entrypoint: always runs 'flm serve'; injects --asr <n> when FLM_ASR is set.
+# External arguments are ignored — use environment variables to configure.
+RUN printf '#!/bin/sh\nset -- serve\n[ -n "${FLM_ASR}" ] && set -- "$@" --asr "${FLM_ASR}"\nexec flm "$@"\n' \
+    > /entrypoint.sh && chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
