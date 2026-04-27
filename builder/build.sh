@@ -3,6 +3,8 @@ set -euo pipefail
 
 KERNEL_VERSION="${KERNEL_VERSION:-}"
 KERNEL_HEADERS_DIR="${KERNEL_HEADERS_DIR:-/inputs/kernel-headers}"
+# If FIRMWARE_DIR is set and non-empty, skip the apt fetch and use it directly.
+FIRMWARE_DIR="${FIRMWARE_DIR:-}"
 AMDXDNA_REF="${AMDXDNA_REF:-main}"
 BUILD_RUN_ID="${BUILD_RUN_ID:-}"
 BUILD_SHA="${BUILD_SHA:-}"
@@ -153,8 +155,11 @@ assemble_sysext() {
     "${PAYLOAD_DIR}/module/amdxdna.ko" \
     "${mod_tree}/usr/lib/modules/${KERNEL_VERSION}/kernel/drivers/accel/amdxdna/amdxdna.ko"
 
-  # extension-release filename must match the image name (without .raw)
-  printf 'ID=_any\n' > "${mod_tree}/usr/lib/extension-release.d/extension-release.${module_name}"
+  # extension-release filename must match the image name (without .raw).
+  # SYSEXT_SCOPE=system: this extension targets the running system (not portable containers).
+  # ARCHITECTURE=x86-64: reject gracefully on wrong-arch hosts.
+  printf 'ID=_any\nSYSEXT_SCOPE=system\nARCHITECTURE=x86-64\n' \
+    > "${mod_tree}/usr/lib/extension-release.d/extension-release.${module_name}"
 
   local module_raw="${WORK_ROOT}/${module_name}.raw"
   mksquashfs "${mod_tree}" "${module_raw}" -comp xz -noappend -quiet
@@ -166,7 +171,8 @@ assemble_sysext() {
     "${fw_tree}/usr/lib/extension-release.d"
 
   rsync -a "${PAYLOAD_DIR}/firmware/" "${fw_tree}/usr/lib/firmware/amdnpu/"
-  printf 'ID=_any\n' > "${fw_tree}/usr/lib/extension-release.d/extension-release.${firmware_name}"
+  printf 'ID=_any\nSYSEXT_SCOPE=system\nARCHITECTURE=x86-64\n' \
+    > "${fw_tree}/usr/lib/extension-release.d/extension-release.${firmware_name}"
 
   local firmware_raw="${WORK_ROOT}/${firmware_name}.raw"
   mksquashfs "${fw_tree}" "${firmware_raw}" -comp xz -noappend -quiet
@@ -204,7 +210,6 @@ assemble_sysext() {
 main() {
   need_cmd git
   need_cmd make
-  need_cmd dpkg-deb
   need_cmd mksquashfs
   need_cmd rsync
   need_cmd tar
@@ -212,7 +217,17 @@ main() {
   [[ -n "${KERNEL_VERSION}" ]] || die "KERNEL_VERSION is required"
 
   prepare
-  fetch_linux_firmware
+
+  if [[ -n "${FIRMWARE_DIR}" ]]; then
+    [[ -d "${FIRMWARE_DIR}" ]] || die "FIRMWARE_DIR not found: ${FIRMWARE_DIR}"
+    log "using pre-fetched firmware from ${FIRMWARE_DIR}"
+    rsync -a --delete "${FIRMWARE_DIR}/" "${PAYLOAD_DIR}/firmware/"
+    echo "pre-fetched" > "${PAYLOAD_DIR}/firmware.commit"
+  else
+    need_cmd dpkg-deb
+    fetch_linux_firmware
+  fi
+
   build_dkms_module
   write_metadata
   assemble_sysext

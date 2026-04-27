@@ -46,7 +46,37 @@ jobs:
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # Job 2: prepare-headers
+  # Job 2: build-firmware
+  # Fetches the linux-firmware package from Ubuntu 24.04 (noble) repos, which
+  # carries the amdnpu firmware that isn't present in jammy (22.04). Runs
+  # independently of the kernel matrix — one firmware artifact shared by all
+  # kernel variants. Uploaded as 'amdxdna-firmware-files' artifact.
+  # ---------------------------------------------------------------------------
+  build-firmware:
+    needs: prepare-matrix
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fetch amdnpu firmware from linux-firmware
+        run: |
+          mkdir -p fw-deb fw-extract
+          cd fw-deb && apt-get download linux-firmware
+          dpkg-deb -x linux-firmware_*.deb ../fw-extract
+          fw_path="$(find ../fw-extract -type d -name amdnpu | head -n1)"
+          [[ -n "${fw_path}" ]] || { echo "ERROR: amdnpu not found in linux-firmware" >&2; exit 1; }
+          mkdir -p ../amdnpu-firmware
+          rsync -a "${fw_path}/" ../amdnpu-firmware/
+          dpkg-deb -f linux-firmware_*.deb Version > ../amdnpu-firmware/.pkg-version
+          echo "linux-firmware version: $(cat ../amdnpu-firmware/.pkg-version)"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: amdxdna-firmware-files
+          path: amdnpu-firmware/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 3: prepare-headers
   # Clones the TrueNAS kernel source, applies the exact three-overlay config
   # sequence, runs make syncconfig + modules_prepare, and saves the result to
   # the Actions cache.  Requires Rust + pahole so that CONFIG_RUST=y and
@@ -141,7 +171,7 @@ jobs:
   # This is the job to re-run when the module compilation or packaging fails.
   # ---------------------------------------------------------------------------
   build:
-    needs: [prepare-matrix, prepare-headers]
+    needs: [prepare-matrix, prepare-headers, build-firmware]
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -168,10 +198,17 @@ jobs:
           key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v10
           fail-on-cache-miss: true
 
+      - name: Download firmware artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: amdxdna-firmware-files
+          path: amdnpu-firmware
+
       - name: Build sysext bundle
         env:
           KERNEL_VERSION: ${{ matrix.kernel_version }}
           KERNEL_HEADERS_DIR: ${{ github.workspace }}/kernel-src
+          FIRMWARE_DIR: ${{ github.workspace }}/amdnpu-firmware
           AMDXDNA_REF: ${{ matrix.dkms_ref }}
           WORK_ROOT: ${{ github.workspace }}/work
           OUT_DIR: ${{ github.workspace }}/out
