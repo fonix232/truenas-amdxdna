@@ -57,8 +57,26 @@ jobs:
           rsync -a fw-git/amdnpu/ amdnpu-firmware/
           git -C fw-git log -1 --format='%H %ai' > amdnpu-firmware/.pkg-version
           echo "linux-firmware commit: $(cat amdnpu-firmware/.pkg-version)"
+
+          # Symlink npu.sbin (unversioned) -> latest npu.sbin.<ver> in each subdir.
+          # The kernel module requests firmware by the unversioned name.
+          find amdnpu-firmware -mindepth 1 -maxdepth 1 -type d | while read -r dir; do
+            mapfile -t candidates < <(find "${dir}" -maxdepth 1 -name 'npu.sbin.*' | sort -V)
+            if [[ ${#candidates[@]} -eq 0 ]]; then
+              echo "WARNING: no versioned npu.sbin.* found in ${dir}" >&2
+              continue
+            fi
+            echo "  ${dir}: candidates (version-sorted):"
+            for f in "${candidates[@]}"; do echo "    $(basename "${f}")"; done
+            latest="${candidates[-1]}"
+            echo "  ${dir}: selecting $(basename "${latest}") as latest"
+            ln -sf "$(basename "${latest}")" "${dir}/npu.sbin"
+            echo "  ${dir}: npu.sbin -> $(readlink "${dir}/npu.sbin")"
+          done
+
           echo "--- amdnpu firmware files ---"
-          find amdnpu-firmware -type f | sort
+          find amdnpu-firmware -not -name '.pkg-version' | sort | \
+            xargs -I{} sh -c 'if [ -L "{}" ]; then echo "  L {}  ->  $(readlink {})"; else echo "  F {}"; fi'
           echo "-----------------------------"
 
       - uses: actions/upload-artifact@v7
