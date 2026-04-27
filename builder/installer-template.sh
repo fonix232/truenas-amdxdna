@@ -2,7 +2,6 @@
 set -euo pipefail
 
 PAYLOAD_LINE=__PAYLOAD_LINE__
-EMBEDDED_KREL="__TARGET_KREL__"
 
 # /var/lib/extensions is a standard systemd-sysext search directory
 # and is writable on TrueNAS SCALE (/var is a separate writable dataset).
@@ -12,7 +11,7 @@ RELOAD_MODULE="${RELOAD_MODULE:-1}"
 usage() {
   cat <<'EOF'
 Usage:
-  ./amdxdna-override-<krel>.run [options]
+  ./amdxdna-override.run [options]
 
 Options:
   --sysext-dir <path>     Sysext extensions directory
@@ -21,9 +20,9 @@ Options:
   --help                  Show this help
 
 Notes:
-  Extensions are placed in /var/lib/extensions (or --sysext-dir), which is
-  a standard systemd-sysext search directory. After a TrueNAS system update
-  (new boot environment), re-run this installer to restore the extensions.
+  The installer auto-detects the running kernel and selects the matching
+  module sysext from the bundle. Extensions are placed in /var/lib/extensions
+  (or --sysext-dir). After a TrueNAS system update, re-run this installer.
 EOF
 }
 
@@ -49,10 +48,12 @@ main() {
   need_cmd tar
   need_cmd systemd-sysext
 
-  # Derive sysext image names from the embedded kernel release.
-  # Strip +truenas local suffix for human-friendly names:
+  # Auto-detect the running kernel release and find the matching module raw.
+  # Strip the +truenas local version suffix for the image name:
   #   6.18.13-production+truenas  →  amdxdna-6.18.13-production.raw
-  local base_krel="${EMBEDDED_KREL%%+*}"
+  local running_krel
+  running_krel="$(uname -r)"
+  local base_krel="${running_krel%%+*}"
   local module_raw="amdxdna-${base_krel}.raw"
   local firmware_raw="amdxdna-firmware.raw"
 
@@ -67,8 +68,13 @@ main() {
   # Extract the bundle embedded in this self-extracting file
   mkdir -p "${tmp_dir}/payload"
   tail -n +"${PAYLOAD_LINE}" "$0" | tar -xz -C "${tmp_dir}/payload"
-  [[ -f "${tmp_dir}/payload/${module_raw}" ]] \
-    || { echo "ERROR: ${module_raw} not found in payload" >&2; exit 1; }
+  if [[ ! -f "${tmp_dir}/payload/${module_raw}" ]]; then
+    echo "ERROR: no module sysext for kernel '${running_krel}' in this bundle" >&2
+    echo "Available module images:" >&2
+    find "${tmp_dir}/payload" -name 'amdxdna-*.raw' ! -name 'amdxdna-firmware.raw' \
+      -printf '  %f\n' >&2 || true
+    exit 1
+  fi
   [[ -f "${tmp_dir}/payload/${firmware_raw}" ]] \
     || { echo "ERROR: ${firmware_raw} not found in payload" >&2; exit 1; }
 
@@ -85,7 +91,7 @@ main() {
   systemd-sysext merge
 
   if [[ "${RELOAD_MODULE}" == "1" ]]; then
-    depmod -a "${EMBEDDED_KREL}" 2>/dev/null || true
+    depmod -a "${running_krel}" 2>/dev/null || true
     if lsmod | awk '{print $1}' | grep -qx amdxdna; then
       modprobe -r amdxdna || true
     fi

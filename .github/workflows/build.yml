@@ -234,7 +234,7 @@ jobs:
           pattern: amdxdna-ko-*
           merge-multiple: false
 
-      - name: Assemble all sysext images and .run installers
+      - name: Assemble all sysext images and .run installer
         env:
           MATRIX: ${{ needs.prepare-matrix.outputs.matrix }}
           BUILD_RUN_ID: ${{ github.run_id }}
@@ -252,7 +252,12 @@ jobs:
           rsync -a amdnpu-firmware/ "${fw_tree}/usr/lib/firmware/amdnpu/"
           printf 'ID=_any\nSYSEXT_SCOPE=system\nARCHITECTURE=x86-64\n' \
             > "${fw_tree}/usr/lib/extension-release.d/extension-release.${firmware_name}"
-          mksquashfs "${fw_tree}" "out/${firmware_name}.raw" -comp xz -noappend -quiet
+          mksquashfs "${fw_tree}" "work/${firmware_name}.raw" -comp xz -noappend -quiet
+
+          # Build a module sysext raw for every kernel×mode and collect metadata
+          bundle_dir="work/bundle"
+          mkdir -p "${bundle_dir}"
+          cp "work/${firmware_name}.raw" "${bundle_dir}/"
 
           echo "${MATRIX}" | jq -r '.[] | [.truenas_tag, .base_version, .dkms_ref] | @tsv' | \
           while IFS=$'\t' read -r truenas_tag base_version dkms_ref; do
@@ -265,7 +270,6 @@ jobs:
               [[ -f "${ko_dir}/amdxdna.ko" ]] \
                 || { echo "ERROR: ${ko_dir}/amdxdna.ko not found" >&2; exit 1; }
 
-              # Module sysext
               mod_tree="work/sysext-module-${base_krel}"
               mkdir -p \
                 "${mod_tree}/usr/lib/modules/${kver}/kernel/drivers/accel/amdxdna" \
@@ -274,7 +278,7 @@ jobs:
                 "${mod_tree}/usr/lib/modules/${kver}/kernel/drivers/accel/amdxdna/amdxdna.ko"
               printf 'ID=_any\nSYSEXT_SCOPE=system\nARCHITECTURE=x86-64\n' \
                 > "${mod_tree}/usr/lib/extension-release.d/extension-release.${module_name}"
-              mksquashfs "${mod_tree}" "out/${module_name}.raw" -comp xz -noappend -quiet
+              mksquashfs "${mod_tree}" "${bundle_dir}/${module_name}.raw" -comp xz -noappend -quiet
 
               pkg_ver="$(grep -m1 'XDNA_DRIVER_VERSION' "${ko_dir}/Makefile" \
                 | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || echo '0.0.0')"
@@ -287,28 +291,21 @@ jobs:
                 printf 'BUILD_RUN_ID=%s\n'          "${BUILD_RUN_ID}"
                 printf 'BUILD_SHA=%s\n'             "${BUILD_SHA}"
                 printf 'BUILD_TIME_UTC=%s\n'        "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-              } > "out/metadata-${base_krel}.env"
-
-              bundle_dir="work/bundle-${base_krel}"
-              mkdir -p "${bundle_dir}"
-              cp "out/${module_name}.raw" "out/${firmware_name}.raw" \
-                 "out/metadata-${base_krel}.env" "${bundle_dir}/"
-              tar -C "${bundle_dir}" -czf "work/bundle-${base_krel}.tar.gz" .
-
-              installer="builder/installer-template.sh"
-              run_file="out/amdxdna-override-${kver}.run"
-              payload_line="$(($(wc -l < "${installer}") + 1))"
-              sed \
-                -e "s|__PAYLOAD_LINE__|${payload_line}|g" \
-                -e "s|__TARGET_KREL__|${kver}|g" \
-                "${installer}" > "${run_file}"
-              cat "work/bundle-${base_krel}.tar.gz" >> "${run_file}"
-              chmod +x "${run_file}"
+              } >> "${bundle_dir}/metadata.env"
             done
           done
+
+          tar -C "${bundle_dir}" -czf work/bundle.tar.gz .
+
+          installer="builder/installer-template.sh"
+          run_file="out/amdxdna-override.run"
+          payload_line="$(($(wc -l < "${installer}") + 1))"
+          sed -e "s|__PAYLOAD_LINE__|${payload_line}|g" "${installer}" > "${run_file}"
+          cat work/bundle.tar.gz >> "${run_file}"
+          chmod +x "${run_file}"
 
       - uses: actions/upload-artifact@v7
         with:
           name: amdxdna-sysext
-          path: out/
+          path: out/*.run
           retention-days: 30
