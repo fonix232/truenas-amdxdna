@@ -1,77 +1,46 @@
 # truenas-amdxdna
 
-Automated build pipeline that produces two [systemd-sysext](https://www.freedesktop.org/software/systemd/man/systemd-sysext.html) extension images (`.raw` SquashFS) containing:
+Automated CI pipeline that produces a single self-extracting `.run` installer
+containing [systemd-sysext](https://www.freedesktop.org/software/systemd/man/systemd-sysext.html)
+images for the AMD XDNA kernel module and NPU firmware.
 
-- **`amdxdna-<base_krel>.raw`** — the `amdxdna.ko` kernel module, compiled from [amd/xdna-driver](https://github.com/amd/xdna-driver) DKMS source against the exact TrueNAS kernel (kernel-versioned)
-- **`amdxdna-firmware.raw`** — AMD NPU firmware files from the Ubuntu `linux-firmware` apt package (`amdnpu/` subtree) (shared, not kernel-versioned)
+The `.run` auto-detects the running kernel and installs the matching variant.
 
-TrueNAS SCALE 26+ ships `systemd-sysext` and already uses it for first-party extensions. Two extension images are placed in `/usr/share/truenas/sysext-extensions/` — one for the kernel module (kernel-versioned) and one for the firmware (shared) — and are merged over `/usr` on every boot without touching the read-only system image.
+## What's inside the bundle
 
-## How it works
+| Image | Content | Kernel-versioned? |
+|---|---|---|
+| `amdxdna-<base_krel>.raw` | `amdxdna.ko` compiled from [amd/xdna-driver](https://github.com/amd/xdna-driver) | Yes — one per kernel + mode |
+| `amdxdna-firmware.raw` | `amdnpu/` firmware from [linux-firmware git](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git) | No — shared |
 
-```
-kernels.json  →  GitHub Actions matrix
-                       ↓
-         truenas/linux  (kernel headers)
-         amd/xdna-driver  (DKMS)
-         linux-firmware apt package  (amdnpu/)
-                       ↓
-              amdxdna-<base_krel>.raw   (module, kernel-versioned)
-              amdxdna-firmware.raw      (firmware, shared)
-                + .run self-extracting installer
-                       ↓
-         /usr/share/truenas/sysext-extensions/
-           amdxdna-6.18.13-production.raw
-           amdxdna-firmware.raw
-                       ↓
-         systemd-sysext merge  →  /usr/lib/modules/<kver>/…/amdxdna.ko
-                                   /usr/lib/firmware/amdnpu/…
-```
-
-The `.raw` images are split by concern so firmware can be updated independently of the kernel module:
-
-```
-# Module sysext  (kernel-versioned, one per kernel release+mode)
-amdxdna-6.18.13-production/
-  usr/
-    lib/
-      modules/6.18.13-production+truenas/kernel/drivers/accel/amdxdna/amdxdna.ko
-      extension-release.d/extension-release.amdxdna-6.18.13-production
-
-# Firmware sysext  (shared, not kernel-versioned)
-amdxdna-firmware/
-  usr/
-    lib/
-      firmware/amdnpu/
-      extension-release.d/extension-release.amdxdna-firmware
-```
-
-Both images use `ID=_any` in their extension-release file, making them compatible with any TrueNAS release version.
-
-The sysext name for the module image strips the `+truenas` local suffix for readability:
-`6.18.13-production+truenas` → `amdxdna-6.18.13-production.raw`
+Both images use `ID=_any` in their extension-release files, making them
+compatible with any TrueNAS OS version. Extensions are placed in
+`/var/lib/extensions/` and merged over `/usr` by `systemd-sysext`.
 
 ## Repository layout
 
 ```
-kernels.json                   Kernel build matrix
+kernels.json                     Kernel build matrix
 builder/
-  build.sh                     Fetch → build → assemble pipeline
-  installer-template.sh        Self-extracting installer template
+  1_fetch_firmware.sh            Fetch amdnpu firmware from kernel.org git, create npu.sbin symlinks
+  2_prepare_headers.sh           Clone truenas/linux, apply config overlays, run modules_prepare
+  3_package.sh                   Assemble sysext .raw images and single .run self-extractor
+  installer-template.sh          Self-extracting installer (baked into .run at package time)
 .github/
-  workflows/build.yml          GitHub Actions CI workflow
+  workflows/build.yml            GitHub Actions CI workflow (5 jobs)
+  copilot-instructions.md        AI assistant context for this repo
 ```
 
-## kernels.json schema
+## kernels.json
 
-Each entry defines a TrueNAS release to build for. The matrix expands one job per mode:
+Each entry defines a TrueNAS release to build for. Both production and debug
+modes are built automatically.
 
 ```json
 [
   {
     "base_version": "6.18.13",
     "truenas_tag":  "TS-26.0.0-BETA.1",
-    "modes":        ["production"],
     "dkms_ref":     "main"
   }
 ]
@@ -80,66 +49,59 @@ Each entry defines a TrueNAS release to build for. The matrix expands one job pe
 | Field | Required | Description |
 |---|---|---|
 | `base_version` | yes | Kernel version number (e.g. `6.18.13`) |
-| `truenas_tag` | yes | Git tag on [truenas/linux](https://github.com/truenas/linux) (e.g. `TS-26.0.0-BETA.1`) |
-| `modes` | no | `production` and/or `debug` — defaults to `["production"]` |
+| `truenas_tag` | yes | Git tag on [truenas/linux](https://github.com/truenas/linux) |
 | `dkms_ref` | no | Branch/tag on amd/xdna-driver — defaults to `main` |
 
-The full kernel release string `<base_version>-<mode>+truenas` (e.g. `6.18.13-production+truenas`) is computed automatically.
+The full kernel release string `<base_version>-<mode>+truenas` is computed
+automatically. Both `production` and `debug` are always built (their vermagic
+strings differ, so each needs its own `.ko`).
 
-`production` and `debug` modules are built separately because the kernels have different configs (vermagic differs); a `production` `.ko` will not load on a `debug` kernel.
+## CI pipeline (GitHub Actions)
 
-## CI builds (GitHub Actions)
+Five jobs, all re-runnable independently:
 
-Pushes to `main` and pull requests trigger a build for every entry × mode in `kernels.json`. Each job:
+| Job | Runner | Purpose |
+|---|---|---|
+| `prepare-matrix` | ubuntu-24.04 | Read kernels.json, emit matrix JSON |
+| `build-firmware` | ubuntu-24.04 | Fetch amdnpu firmware from kernel.org; cached by git commit |
+| `prepare-headers` | ubuntu-22.04 | Clone truenas/linux, apply 3-overlay config, run modules_prepare; cached per tag+mode |
+| `build` | ubuntu-22.04 | Restore headers cache, build amdxdna.ko, upload artifact |
+| `package` | ubuntu-24.04 | Assemble all .raw images + single .run; re-run alone after installer changes |
 
-1. Clones [truenas/linux](https://github.com/truenas/linux) at `truenas_tag`, prepares headers
-2. Runs `builder/build.sh` directly on the runner (Ubuntu 24.04, packages installed via apt)
-3. Uploads `amdxdna-<base_krel>.raw`, `amdxdna-firmware.raw`, and `amdxdna-override-<kernel_version>.run` as artifacts (the full `out/` directory)
+Caches are keyed to avoid redundant work:
+- Kernel headers: `truenas-kernel-headers-{tag}-{mode}-v11`
+- Firmware: `amdxdna-firmware-{linux-firmware HEAD SHA}`
 
-Kernel headers are cached per `truenas_tag` + `mode` to speed up subsequent runs.
+To build a single release via `workflow_dispatch`, enter the `truenas_tag`
+value (e.g. `TS-26.0.0-BETA.1`) in the **single_version** input.
 
-To build a single release via `workflow_dispatch`, enter the `truenas_tag` value (e.g. `TS-26.0.0-BETA.1`) in the **single_version** input.
+## Installing on TrueNAS SCALE
 
-Artifacts are retained for 30 days and can be downloaded from the Actions run page.
-
-## Surviving TrueNAS updates
-
-Extensions placed in `/usr/share/truenas/sysext-extensions/` live inside the active boot environment's `/usr` dataset (`boot-pool/ROOT/<version>/usr`). When TrueNAS performs an update it activates a new boot environment — the new BE's `/usr` is a fresh dataset and does not contain the installed extensions.
-
-**Re-run the installer after every TrueNAS update.** The process is fast: the firmware `.raw` is not kernel-versioned so it works immediately; the module `.raw` only needs a rebuild if the kernel version changed (which will produce a new `.run` artifact from CI).
-
-## Installing on TrueNAS
-
-Copy the `.run` to TrueNAS and execute as root:
+Download `amdxdna-override.run` from the Actions run artifacts, copy to
+TrueNAS, and run as root:
 
 ```bash
-scp out/amdxdna-override-6.18.13-production+truenas.run root@freya:
-bash amdxdna-override-6.18.13-production+truenas.run
+scp amdxdna-override.run root@freya:
+bash amdxdna-override.run
 ```
 
 The installer:
-
-1. Reads `bootfs` from `zpool get -H -o value bootfs boot-pool` to identify the active boot environment's `/usr` dataset (e.g. `boot-pool/ROOT/26.0.0-BETA.1/usr`)
-2. Sets `readonly=off` on that dataset (`trap EXIT` guarantees it is always re-locked, even on error)
-3. Unmerges any currently active sysext extensions
-4. Installs `amdxdna-<base_krel>.raw` and `amdxdna-firmware.raw` into `/usr/share/truenas/sysext-extensions/`
-5. Re-locks the dataset (`readonly=on`)
-6. Runs `systemd-sysext merge`, `depmod`, and reloads the `amdxdna` module
+1. Auto-detects the running kernel via `uname -r`
+2. Selects the matching `amdxdna-<base_krel>.raw` from the bundle
+3. Lists available variants and exits cleanly if no match is found
+4. Installs both `.raw` images into `/var/lib/extensions/`
+5. Runs `systemd-sysext merge`, `depmod`, and `modprobe amdxdna`
 
 Optional flags:
-
 ```
---zfs-boot-pool <pool>  Override ZFS pool name (default: boot-pool)
---sysext-dir <path>     Override extension directory
-                        (default: /usr/share/truenas/sysext-extensions)
---no-reload             Skip module reload after merge
+--sysext-dir <path>   Override install directory (default: /var/lib/extensions)
+--no-reload           Skip module reload after merge
 ```
 
-## Fixed sources
+## After a TrueNAS system update
 
-| Source | URL |
-|---|---|
-| Kernel | <https://github.com/truenas/linux> |
-| DKMS driver | <https://github.com/amd/xdna-driver> |
-| Firmware | Ubuntu `linux-firmware` apt package (Ubuntu 24.04 runner) |
+TrueNAS updates activate a new boot environment. `/var/lib/extensions/` is
+on a writable dataset and persists across BEs, so the extensions survive
+unless TrueNAS wipes that dataset. Re-run the installer if the module fails
+to load after an update (a new kernel version will need a new CI build).
 

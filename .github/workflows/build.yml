@@ -48,6 +48,8 @@ jobs:
     outputs:
       fw_commit: ${{ steps.head.outputs.fw_commit }}
     steps:
+      - uses: actions/checkout@v6
+
       - name: Get linux-firmware HEAD commit
         id: head
         run: |
@@ -66,34 +68,7 @@ jobs:
 
       - name: Fetch and assemble amdnpu firmware
         if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p amdnpu-firmware
-          git clone --depth 1 \
-            https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git \
-            fw-git
-          [[ -d fw-git/amdnpu ]] \
-            || { echo "ERROR: amdnpu not found in linux-firmware git" >&2; exit 1; }
-          rsync -a fw-git/amdnpu/ amdnpu-firmware/
-          git -C fw-git log -1 --format='%H %ai' > amdnpu-firmware/.pkg-version
-          echo "linux-firmware commit: $(cat amdnpu-firmware/.pkg-version)"
-
-          # Symlink npu.sbin (unversioned) -> latest npu.sbin.<ver> in each subdir.
-          # The kernel module requests firmware by the unversioned name.
-          find amdnpu-firmware -mindepth 1 -maxdepth 1 -type d | while read -r dir; do
-            mapfile -t candidates < <(find "${dir}" -maxdepth 1 -name 'npu.sbin.*' | sort -V)
-            if [[ ${#candidates[@]} -eq 0 ]]; then
-              echo "WARNING: no versioned npu.sbin.* found in ${dir}" >&2; continue
-            fi
-            echo "  ${dir}: candidates: ${candidates[*]##*/}"
-            latest="${candidates[-1]}"
-            ln -sf "$(basename "${latest}")" "${dir}/npu.sbin"
-            echo "  ${dir}: npu.sbin -> $(readlink "${dir}/npu.sbin")"
-          done
-
-          echo "--- amdnpu firmware files ---"
-          find amdnpu-firmware -not -name '.pkg-version' | sort | \
-            xargs -I{} sh -c 'if [ -L "{}" ]; then echo "  L {}  ->  $(readlink {})"; else echo "  F {}"; fi'
-          echo "-----------------------------"
+        run: bash builder/1_fetch_firmware.sh
 
       - name: Save firmware cache
         if: steps.cache.outputs.cache-hit != 'true'
@@ -122,6 +97,8 @@ jobs:
     name: "headers / ${{ matrix.kernel.truenas_tag }} / ${{ matrix.mode }}"
 
     steps:
+      - uses: actions/checkout@v6
+
       - name: Install kernel-prep dependencies
         run: |
           sudo apt-get update
@@ -149,25 +126,7 @@ jobs:
         env:
           KERNEL_SOURCE_REF: ${{ matrix.kernel.truenas_tag }}
           BUILD_MODE: ${{ matrix.mode }}
-        run: |
-          git -c init.defaultBranch=main clone --depth 1 --branch "${KERNEL_SOURCE_REF}" \
-            https://github.com/truenas/linux kernel-src
-          rm -rf kernel-src/.git kernel-src/.gitattributes kernel-src/.gitignore
-          cd kernel-src
-          make ARCH=x86_64 defconfig
-          ./scripts/kconfig/merge_config.sh .config scripts/package/truenas/debian_amd64.config
-          ./scripts/kconfig/merge_config.sh .config scripts/package/truenas/truenas.config
-          if [[ "${BUILD_MODE}" == "debug" ]]; then
-            ./scripts/kconfig/merge_config.sh .config \
-              scripts/package/truenas/tn-debug.config 2>/dev/null || \
-            ./scripts/kconfig/merge_config.sh .config \
-              scripts/package/truenas/tn-production.config
-          else
-            ./scripts/kconfig/merge_config.sh .config scripts/package/truenas/tn-production.config
-          fi
-          ./scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
-          make syncconfig
-          make -j$(nproc) scripts prepare modules_prepare
+        run: bash builder/2_prepare_headers.sh
 
   # ---------------------------------------------------------------------------
   # Job 4: build
@@ -252,6 +211,8 @@ jobs:
     needs: [prepare-matrix, build, build-firmware]
     runs-on: ubuntu-24.04
     name: "package"
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v6
@@ -280,74 +241,48 @@ jobs:
           MATRIX: ${{ needs.prepare-matrix.outputs.matrix }}
           BUILD_RUN_ID: ${{ github.run_id }}
           BUILD_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          mkdir -p out work
-          firmware_name="amdxdna-firmware"
-          fw_ver="$(cat amdnpu-firmware/.pkg-version 2>/dev/null || echo unknown)"
-
-          # Firmware sysext — built once, shared by all kernel variants
-          fw_tree="work/sysext-firmware"
-          mkdir -p "${fw_tree}/usr/lib/firmware/amdnpu" \
-                   "${fw_tree}/usr/lib/extension-release.d"
-          rsync -a amdnpu-firmware/ "${fw_tree}/usr/lib/firmware/amdnpu/"
-
-          printf 'ID=_any\nSYSEXT_SCOPE=system\nARCHITECTURE=x86-64\n' \
-            > "${fw_tree}/usr/lib/extension-release.d/extension-release.${firmware_name}"
-          mksquashfs "${fw_tree}" "work/${firmware_name}.raw" -comp xz -noappend -quiet
-
-          # Build a module sysext raw for every kernel×mode and collect metadata
-          bundle_dir="work/bundle"
-          mkdir -p "${bundle_dir}"
-          cp "work/${firmware_name}.raw" "${bundle_dir}/"
-
-          echo "${MATRIX}" | jq -r '.[] | [.truenas_tag, .base_version, .dkms_ref] | @tsv' | \
-          while IFS=$'\t' read -r truenas_tag base_version dkms_ref; do
-            for mode in production debug; do
-              kver="${base_version}-${mode}+truenas"
-              base_krel="${kver%%+*}"
-              module_name="amdxdna-${base_krel}"
-              ko_dir="amdxdna-ko-${truenas_tag}-${mode}"
-
-              [[ -f "${ko_dir}/amdxdna.ko" ]] \
-                || { echo "ERROR: ${ko_dir}/amdxdna.ko not found" >&2; exit 1; }
-
-              mod_tree="work/sysext-module-${base_krel}"
-              mkdir -p \
-                "${mod_tree}/usr/lib/modules/${kver}/kernel/drivers/accel/amdxdna" \
-                "${mod_tree}/usr/lib/extension-release.d"
-              install -m 0644 "${ko_dir}/amdxdna.ko" \
-                "${mod_tree}/usr/lib/modules/${kver}/kernel/drivers/accel/amdxdna/amdxdna.ko"
-              printf 'ID=_any\nSYSEXT_SCOPE=system\nARCHITECTURE=x86-64\n' \
-                > "${mod_tree}/usr/lib/extension-release.d/extension-release.${module_name}"
-              mksquashfs "${mod_tree}" "${bundle_dir}/${module_name}.raw" -comp xz -noappend -quiet
-
-              pkg_ver="$(grep -m1 'XDNA_DRIVER_VERSION' "${ko_dir}/Makefile" \
-                | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || echo '0.0.0')"
-
-              {
-                printf 'KERNEL_VERSION=%s\n'        "${kver}"
-                printf 'DKMS_REF=%s\n'              "${dkms_ref}"
-                printf 'DKMS_VERSION=%s\n'          "${pkg_ver}"
-                printf 'FIRMWARE_PKG_VERSION=%s\n'  "${fw_ver}"
-                printf 'BUILD_RUN_ID=%s\n'          "${BUILD_RUN_ID}"
-                printf 'BUILD_SHA=%s\n'             "${BUILD_SHA}"
-                printf 'BUILD_TIME_UTC=%s\n'        "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-              } >> "${bundle_dir}/metadata.env"
-            done
-          done
-
-          tar -C "${bundle_dir}" -czf work/bundle.tar.gz .
-
-          installer="builder/installer-template.sh"
-          run_file="out/amdxdna-override.run"
-          payload_line="$(($(wc -l < "${installer}") + 1))"
-          sed -e "s|__PAYLOAD_LINE__|${payload_line}|g" "${installer}" > "${run_file}"
-          cat work/bundle.tar.gz >> "${run_file}"
-          chmod +x "${run_file}"
+        run: bash builder/3_package.sh
 
       - uses: actions/upload-artifact@v7
         with:
           name: amdxdna-sysext
           path: out/*.run
           retention-days: 30
+
+      - name: Read xdna version
+        id: ver
+        run: echo "xdna_ver=$(cat out/version.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        id: check-release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          if gh release view "v${{ steps.ver.outputs.xdna_ver }}" \
+              --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release v${{ steps.ver.outputs.xdna_ver }} already exists — skipping"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create GitHub Release
+        if: >
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          steps.check-release.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.xdna_ver }}
+          name: amdxdna ${{ steps.ver.outputs.xdna_ver }}
+          body: |
+            AMD XDNA kernel module sysext for TrueNAS SCALE.
+            Built from [amd/xdna-driver](https://github.com/amd/xdna-driver) version ${{ steps.ver.outputs.xdna_ver }}.
+
+            ## Install
+            ```bash
+            bash amdxdna-override-${{ steps.ver.outputs.xdna_ver }}.run
+            ```
+            The installer auto-detects the running kernel and selects the correct module variant.
+          files: out/*.run
