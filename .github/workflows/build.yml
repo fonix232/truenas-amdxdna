@@ -12,6 +12,12 @@ on:
         default: ""
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: prepare-matrix
+  # Reads kernels.json and emits a matrix of {truenas_tag, base_version,
+  # dkms_ref}. Mode (production/debug) is added as a separate matrix axis
+  # in each downstream job, so every kernel gets both builds automatically.
+  # ---------------------------------------------------------------------------
   prepare-matrix:
     runs-on: ubuntu-24.04
     outputs:
@@ -24,52 +30,34 @@ jobs:
         env:
           SINGLE_VERSION: ${{ inputs.single_version }}
         run: |
-          # Expand each kernel entry into one job per mode, computing the full kernel release string.
-          expanded=$(jq -c '[
-            .[] | . as $e |
-            (if $e.modes then $e.modes else ["production"] end)[] | . as $mode |
-            {
-              base_version: $e.base_version,
-              truenas_tag:  $e.truenas_tag,
-              mode:         $mode,
-              kernel_version: ($e.base_version + "-" + $mode + "+truenas"),
-              dkms_ref:     ($e.dkms_ref // "main")
-            }
-          ]' kernels.json)
+          expanded=$(jq -c '[.[] | {base_version, truenas_tag, dkms_ref: (.dkms_ref // "main")}]' kernels.json)
           if [[ -n "${SINGLE_VERSION}" ]]; then
-            matrix=$(echo "${expanded}" | jq -c --arg v "${SINGLE_VERSION}" '[.[] | select(.truenas_tag == $v)]')
-            [[ "$(echo "${matrix}" | jq 'length')" -gt 0 ]] \
+            expanded=$(echo "${expanded}" | jq -c --arg v "${SINGLE_VERSION}" '[.[] | select(.truenas_tag == $v)]')
+            [[ "$(echo "${expanded}" | jq 'length')" -gt 0 ]] \
               || { echo "ERROR: '${SINGLE_VERSION}' not found in kernels.json" >&2; exit 1; }
-          else
-            matrix="${expanded}"
           fi
-          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "matrix=${expanded}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Job 2: build-firmware
-  # Fetches the linux-firmware package from Ubuntu 24.04 (noble) repos, which
-  # carries the amdnpu firmware that isn't present in jammy (22.04). Runs
-  # independently of the kernel matrix — one firmware artifact shared by all
-  # kernel variants. Uploaded as 'amdxdna-firmware-files' artifact.
+  # Fetches linux-firmware from Ubuntu 24.04 (noble), which carries amdnpu
+  # firmware absent from jammy. Runs once, shared by all kernel/mode variants.
   # ---------------------------------------------------------------------------
   build-firmware:
-    needs: prepare-matrix
     runs-on: ubuntu-24.04
     steps:
       - name: Fetch amdnpu firmware from linux-firmware
         run: |
-          mkdir -p fw-deb fw-extract
+          mkdir -p fw-deb fw-extract amdnpu-firmware
           cd fw-deb && apt-get download linux-firmware
           dpkg-deb -x linux-firmware_*.deb ../fw-extract
           fw_path="$(find ../fw-extract -type d -name amdnpu | head -n1)"
           [[ -n "${fw_path}" ]] || { echo "ERROR: amdnpu not found in linux-firmware" >&2; exit 1; }
-          mkdir -p ../amdnpu-firmware
           rsync -a "${fw_path}/" ../amdnpu-firmware/
           dpkg-deb -f linux-firmware_*.deb Version > ../amdnpu-firmware/.pkg-version
           echo "linux-firmware version: $(cat ../amdnpu-firmware/.pkg-version)"
 
-      - name: Upload firmware artifact
-        uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7
         with:
           name: amdxdna-firmware-files
           path: amdnpu-firmware/
@@ -77,13 +65,11 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Job 3: prepare-headers
-  # Clones the TrueNAS kernel source, applies the exact three-overlay config
-  # sequence, runs make syncconfig + modules_prepare, and saves the result to
-  # the Actions cache.  Requires Rust + pahole so that CONFIG_RUST=y and
-  # CONFIG_DEBUG_INFO_BTF=y survive syncconfig (matching the production kernel).
-  # This job is the slow step (~15 min cold); once cached it exits quickly.
-  # Re-running the downstream build job re-uses the cache without re-running
-  # this job.
+  # Clones truenas/linux, applies the exact three-overlay config sequence, runs
+  # make syncconfig + modules_prepare, saves to cache. Requires Rust 1.91.1 +
+  # pahole so CONFIG_RUST=y and CONFIG_DEBUG_INFO_BTF=y survive syncconfig,
+  # matching the production kernel's struct layouts exactly.
+  # Matrix: kernels × {production, debug}
   # ---------------------------------------------------------------------------
   prepare-headers:
     needs: prepare-matrix
@@ -91,30 +77,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+        kernel: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+        mode: [production, debug]
 
-    name: "headers / ${{ matrix.truenas_tag }} / ${{ matrix.mode }}"
+    name: "headers / ${{ matrix.kernel.truenas_tag }} / ${{ matrix.mode }}"
 
     steps:
-      - uses: actions/checkout@v6
-
       - name: Install kernel-prep dependencies
         run: |
           sudo apt-get update
-          # dwarves (pahole) is required for CONFIG_DEBUG_INFO_BTF=y.
-          # Without it syncconfig disables BTF, changing struct module layout.
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential dwarves flex gawk git \
             libcap-dev libelf-dev liblzma-dev libssl-dev \
             make python3-dev
 
-      - name: Install Rust toolchain
+      - name: Install Rust 1.91.1 + bindgen 0.72.1
         run: |
-          # The production TrueNAS kernel was built with CONFIG_RUST=y.
-          # debian_amd64.config embeds RUSTC_VERSION=109101 (rustc 1.91.1)
-          # and bindgen 0.72.1. make syncconfig validates installed versions
-          # against these values; mismatches silently set CONFIG_RUST=n,
-          # changing struct layouts → 'existing value is nonzero' at modprobe.
           rustup toolchain install 1.91.1-x86_64-unknown-linux-gnu --profile minimal
           rustup default 1.91.1-x86_64-unknown-linux-gnu
           rustup component add rust-src rustfmt
@@ -125,50 +103,39 @@ jobs:
         uses: actions/cache@v5
         with:
           path: kernel-src
-          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v10
+          key: truenas-kernel-headers-${{ matrix.kernel.truenas_tag }}-${{ matrix.mode }}-v11
 
-      - name: Fetch and prepare kernel headers
+      - name: Clone and prepare kernel source
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         env:
-          KERNEL_SOURCE_REF: ${{ matrix.truenas_tag }}
+          KERNEL_SOURCE_REF: ${{ matrix.kernel.truenas_tag }}
           BUILD_MODE: ${{ matrix.mode }}
         run: |
           git -c init.defaultBranch=main clone --depth 1 --branch "${KERNEL_SOURCE_REF}" \
             https://github.com/truenas/linux kernel-src
-          # Remove .git so scripts/setlocalversion cannot detect a dirty tree
-          # and append a trailing '+' to KERNELRELEASE.
           rm -rf kernel-src/.git kernel-src/.gitattributes kernel-src/.gitignore
           cd kernel-src
-          # Replicate TrueNAS's exact kernel config sequence so that CONFIG-gated
-          # kernel data structures (including struct module) match the running kernel
-          # exactly.  The three overlay files are the same ones used by TrueNAS CI.
           make ARCH=x86_64 defconfig
-          ./scripts/kconfig/merge_config.sh .config \
-            scripts/package/truenas/debian_amd64.config
-          ./scripts/kconfig/merge_config.sh .config \
-            scripts/package/truenas/truenas.config
+          ./scripts/kconfig/merge_config.sh .config scripts/package/truenas/debian_amd64.config
+          ./scripts/kconfig/merge_config.sh .config scripts/package/truenas/truenas.config
           if [[ "${BUILD_MODE}" == "debug" ]]; then
             ./scripts/kconfig/merge_config.sh .config \
               scripts/package/truenas/tn-debug.config 2>/dev/null || \
             ./scripts/kconfig/merge_config.sh .config \
               scripts/package/truenas/tn-production.config
           else
-            ./scripts/kconfig/merge_config.sh .config \
-              scripts/package/truenas/tn-production.config
+            ./scripts/kconfig/merge_config.sh .config scripts/package/truenas/tn-production.config
           fi
-          # truenas.config points SYSTEM_TRUSTED_KEYS at debian/certs/ which is not
-          # present in a shallow clone.  Clear it; the cert bundle is not needed for
-          # modules_prepare and does not affect the compiled struct layout.
           ./scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
           make syncconfig
           make -j$(nproc) scripts prepare modules_prepare
 
   # ---------------------------------------------------------------------------
-  # Job 3: build
-  # Restores the prepared kernel headers from cache, builds amdxdna.ko and
-  # packages it into sysext images.  No Rust required here — the module itself
-  # is pure C; Rust was only needed in prepare-headers for modules_prepare.
-  # This is the job to re-run when the module compilation or packaging fails.
+  # Job 4: build
+  # Restores kernel headers from cache, builds amdxdna.ko, packages sysexts.
+  # Depends on prepare-headers (for the cache) and build-firmware (for the
+  # firmware artifact) — both run independently in parallel.
+  # Matrix: kernels × {production, debug}
   # ---------------------------------------------------------------------------
   build:
     needs: [prepare-matrix, prepare-headers, build-firmware]
@@ -176,9 +143,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+        kernel: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+        mode: [production, debug]
 
-    name: "build / ${{ matrix.truenas_tag }} / ${{ matrix.mode }}"
+    name: "build / ${{ matrix.kernel.truenas_tag }} / ${{ matrix.mode }}"
 
     steps:
       - uses: actions/checkout@v6
@@ -191,38 +159,117 @@ jobs:
             libelf-dev libssl-dev make rsync \
             squashfs-tools tar xz-utils
 
-      - name: Restore prepared kernel headers
+      - name: Restore kernel headers from cache
         uses: actions/cache/restore@v5
         with:
           path: kernel-src
-          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v10
+          key: truenas-kernel-headers-${{ matrix.kernel.truenas_tag }}-${{ matrix.mode }}-v11
           fail-on-cache-miss: true
 
-      - name: Download firmware artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: amdxdna-firmware-files
           path: amdnpu-firmware
 
-      - name: Build sysext bundle
+      - name: Clone xdna-driver
         env:
-          KERNEL_VERSION: ${{ matrix.kernel_version }}
-          KERNEL_HEADERS_DIR: ${{ github.workspace }}/kernel-src
-          FIRMWARE_DIR: ${{ github.workspace }}/amdnpu-firmware
-          AMDXDNA_REF: ${{ matrix.dkms_ref }}
-          WORK_ROOT: ${{ github.workspace }}/work
-          OUT_DIR: ${{ github.workspace }}/out
-          BUILD_RUN_ID: ${{ github.run_id }}
-          BUILD_SHA: ${{ github.sha }}
-          INSTALLER_TEMPLATE: ${{ github.workspace }}/builder/installer-template.sh
+          DKMS_REF: ${{ matrix.kernel.dkms_ref }}
         run: |
-          mkdir -p "${WORK_ROOT}" "${OUT_DIR}"
-          chmod +x builder/build.sh
-          builder/build.sh
+          git clone --depth 1 --branch "${DKMS_REF}" \
+            https://github.com/amd/xdna-driver src/amdxdna-dkms || \
+          git clone --depth 1 https://github.com/amd/xdna-driver src/amdxdna-dkms
 
-      - name: Upload sysext artifacts
-        uses: actions/upload-artifact@v7
+      - name: Generate config_kernel.h
+        env:
+          KERNEL_VERSION: ${{ matrix.kernel.base_version }}-${{ matrix.mode }}+truenas
+        run: |
+          drv_src="src/amdxdna-dkms/drivers/accel/amdxdna"
+          configure_script="src/amdxdna-dkms/drivers/accel/tools/configure_kernel.sh"
+          KERNEL_SRC="${GITHUB_WORKSPACE}/kernel-src" \
+            KERNEL_VER="${KERNEL_VERSION}" \
+            KBUILD_MODPOST_WARN=1 \
+            KCFLAGS="-Wno-unused-variable" \
+            OUT="${drv_src}/config_kernel.h" \
+            bash "${configure_script}"
+
+      - name: Build amdxdna.ko
+        env:
+          KERNEL_VERSION: ${{ matrix.kernel.base_version }}-${{ matrix.mode }}+truenas
+        run: |
+          drv_src="src/amdxdna-dkms/drivers/accel/amdxdna"
+          KBUILD_MODPOST_WARN=1 make -C "${GITHUB_WORKSPACE}/kernel-src" \
+            M="${GITHUB_WORKSPACE}/${drv_src}" \
+            CFLAGS_MODULE="-DAMDXDNA_DEVEL" \
+            OFT_CONFIG_AMDXDNA_PCI=y \
+            modules
+          [[ -f "${drv_src}/amdxdna.ko" ]] || { echo "ERROR: amdxdna.ko not found" >&2; exit 1; }
+
+      - name: Assemble sysext images
+        env:
+          KERNEL_VERSION: ${{ matrix.kernel.base_version }}-${{ matrix.mode }}+truenas
+          DKMS_REF: ${{ matrix.kernel.dkms_ref }}
+        run: |
+          set -euo pipefail
+          drv_src="src/amdxdna-dkms/drivers/accel/amdxdna"
+          base_krel="${KERNEL_VERSION%%+*}"
+          module_name="amdxdna-${base_krel}"
+          firmware_name="amdxdna-firmware"
+          mkdir -p out
+
+          # --- Module sysext ---
+          mod_tree="work/sysext-module"
+          mkdir -p \
+            "${mod_tree}/usr/lib/modules/${KERNEL_VERSION}/kernel/drivers/accel/amdxdna" \
+            "${mod_tree}/usr/lib/extension-release.d"
+          install -m 0644 "${drv_src}/amdxdna.ko" \
+            "${mod_tree}/usr/lib/modules/${KERNEL_VERSION}/kernel/drivers/accel/amdxdna/amdxdna.ko"
+          printf 'ID=_any\nSYSEXT_SCOPE=system\nARCHITECTURE=x86-64\n' \
+            > "${mod_tree}/usr/lib/extension-release.d/extension-release.${module_name}"
+          mksquashfs "${mod_tree}" "out/${module_name}.raw" -comp xz -noappend -quiet
+
+          # --- Firmware sysext ---
+          fw_tree="work/sysext-firmware"
+          mkdir -p \
+            "${fw_tree}/usr/lib/firmware/amdnpu" \
+            "${fw_tree}/usr/lib/extension-release.d"
+          rsync -a amdnpu-firmware/ "${fw_tree}/usr/lib/firmware/amdnpu/"
+          printf 'ID=_any\nSYSEXT_SCOPE=system\nARCHITECTURE=x86-64\n' \
+            > "${fw_tree}/usr/lib/extension-release.d/extension-release.${firmware_name}"
+          mksquashfs "${fw_tree}" "out/${firmware_name}.raw" -comp xz -noappend -quiet
+
+          # --- .run self-extractor ---
+          pkg_ver="$(grep -m1 'XDNA_DRIVER_VERSION' "${drv_src}/Makefile" \
+            | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || echo '0.0.0')"
+          dkms_commit="$(git -C src/amdxdna-dkms rev-parse HEAD)"
+          fw_ver="$(cat amdnpu-firmware/.pkg-version 2>/dev/null || echo unknown)"
+          cat > out/metadata.env <<EOF
+          KERNEL_VERSION=${KERNEL_VERSION}
+          DKMS_REF=${DKMS_REF}
+          DKMS_COMMIT=${dkms_commit}
+          DKMS_VERSION=${pkg_ver}
+          FIRMWARE_PKG_VERSION=${fw_ver}
+          BUILD_RUN_ID=${{ github.run_id }}
+          BUILD_SHA=${{ github.sha }}
+          BUILD_TIME_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+
+          bundle_dir="work/bundle"
+          mkdir -p "${bundle_dir}"
+          cp "out/${module_name}.raw" "out/${firmware_name}.raw" out/metadata.env "${bundle_dir}/"
+          tar -C "${bundle_dir}" -czf work/bundle.tar.gz .
+
+          installer="builder/installer-template.sh"
+          run_file="out/amdxdna-override-${KERNEL_VERSION}.run"
+          payload_line="$(($(wc -l < "${installer}") + 1))"
+          sed \
+            -e "s|__PAYLOAD_LINE__|${payload_line}|g" \
+            -e "s|__TARGET_KREL__|${KERNEL_VERSION}|g" \
+            "${installer}" > "${run_file}"
+          cat work/bundle.tar.gz >> "${run_file}"
+          chmod +x "${run_file}"
+
+      - uses: actions/upload-artifact@v7
         with:
-          name: amdxdna-sysext-${{ matrix.truenas_tag }}-${{ matrix.mode }}
+          name: amdxdna-sysext-${{ matrix.kernel.truenas_tag }}-${{ matrix.mode }}
           path: out/
           retention-days: 30
