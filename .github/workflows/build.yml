@@ -45,7 +45,17 @@ jobs:
           fi
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
 
-  build:
+  # ---------------------------------------------------------------------------
+  # Job 2: prepare-headers
+  # Clones the TrueNAS kernel source, applies the exact three-overlay config
+  # sequence, runs make syncconfig + modules_prepare, and saves the result to
+  # the Actions cache.  Requires Rust + pahole so that CONFIG_RUST=y and
+  # CONFIG_DEBUG_INFO_BTF=y survive syncconfig (matching the production kernel).
+  # This job is the slow step (~15 min cold); once cached it exits quickly.
+  # Re-running the downstream build job re-uses the cache without re-running
+  # this job.
+  # ---------------------------------------------------------------------------
+  prepare-headers:
     needs: prepare-matrix
     runs-on: ubuntu-22.04
     strategy:
@@ -53,36 +63,31 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
 
-    name: "sysext / ${{ matrix.truenas_tag }} / ${{ matrix.mode }}"
+    name: "headers / ${{ matrix.truenas_tag }} / ${{ matrix.mode }}"
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install build dependencies
+      - name: Install kernel-prep dependencies
         run: |
           sudo apt-get update
-          # Match TrueNAS CI package list (ubuntu-22.04) exactly so that
-          # make syncconfig sees the same host tools and produces the same
-          # autoconf.h as the production TrueNAS kernel build.
-          # dwarves (pahole) is required for CONFIG_DEBUG_INFO_BTF=y which
-          # gates struct module fields; without it syncconfig disables BTF
-          # and changes struct module layout.
+          # dwarves (pahole) is required for CONFIG_DEBUG_INFO_BTF=y.
+          # Without it syncconfig disables BTF, changing struct module layout.
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential dwarves flex gawk git kmod \
+            bc bison build-essential dwarves flex gawk git \
             libcap-dev libelf-dev liblzma-dev libssl-dev \
-            make python3-dev rsync squashfs-tools tar xz-utils
+            make python3-dev
 
       - name: Install Rust toolchain
         run: |
           # The production TrueNAS kernel was built with CONFIG_RUST=y.
           # debian_amd64.config embeds RUSTC_VERSION=109101 (rustc 1.91.1)
           # and bindgen 0.72.1. make syncconfig validates installed versions
-          # against these values; if they don't match it silently sets
-          # CONFIG_RUST=n, which changes struct layouts and causes the
-          # 'existing value is nonzero' relocation error at modprobe time.
+          # against these values; mismatches silently set CONFIG_RUST=n,
+          # changing struct layouts → 'existing value is nonzero' at modprobe.
           rustup toolchain install 1.91.1-x86_64-unknown-linux-gnu --profile minimal
           rustup default 1.91.1-x86_64-unknown-linux-gnu
-          rustup component add rust-src
+          rustup component add rust-src rustfmt
           cargo install --locked bindgen-cli --version 0.72.1
 
       - name: Cache prepared kernel headers
@@ -90,7 +95,6 @@ jobs:
         uses: actions/cache@v5
         with:
           path: kernel-src
-          # Cache is per-tag + mode because debug/production have different configs
           key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v10
 
       - name: Fetch and prepare kernel headers
@@ -107,9 +111,7 @@ jobs:
           cd kernel-src
           # Replicate TrueNAS's exact kernel config sequence so that CONFIG-gated
           # kernel data structures (including struct module) match the running kernel
-          # exactly.  Using defconfig alone causes a struct module size mismatch that
-          # makes modprobe fail with "section size must match" even when vermagic is
-          # correct.  The three overlay files are the same ones used by TrueNAS CI.
+          # exactly.  The three overlay files are the same ones used by TrueNAS CI.
           make ARCH=x86_64 defconfig
           ./scripts/kconfig/merge_config.sh .config \
             scripts/package/truenas/debian_amd64.config
@@ -131,6 +133,41 @@ jobs:
           make syncconfig
           make -j$(nproc) scripts prepare modules_prepare
 
+  # ---------------------------------------------------------------------------
+  # Job 3: build
+  # Restores the prepared kernel headers from cache, builds amdxdna.ko and
+  # packages it into sysext images.  No Rust required here — the module itself
+  # is pure C; Rust was only needed in prepare-headers for modules_prepare.
+  # This is the job to re-run when the module compilation or packaging fails.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: [prepare-matrix, prepare-headers]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+
+    name: "build / ${{ matrix.truenas_tag }} / ${{ matrix.mode }}"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential flex git kmod \
+            libelf-dev libssl-dev make rsync \
+            squashfs-tools tar xz-utils
+
+      - name: Restore prepared kernel headers
+        uses: actions/cache/restore@v5
+        with:
+          path: kernel-src
+          key: truenas-kernel-headers-${{ matrix.truenas_tag }}-${{ matrix.mode }}-v10
+          fail-on-cache-miss: true
+
       - name: Build sysext bundle
         env:
           KERNEL_VERSION: ${{ matrix.kernel_version }}
@@ -146,17 +183,9 @@ jobs:
           chmod +x builder/build.sh
           builder/build.sh
 
-      - name: Sanitize artifact name
-        id: artifact-name
-        env:
-          KERNEL_VERSION: ${{ matrix.kernel_version }}
-        run: |
-          safe="$(printf '%s' "${KERNEL_VERSION}" | tr '+/' '__')"
-          echo "name=amdxdna-sysext-${safe}" >> "$GITHUB_OUTPUT"
-
       - name: Upload sysext artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.artifact-name.outputs.name }}
+          name: amdxdna-sysext-${{ matrix.truenas_tag }}-${{ matrix.mode }}
           path: out/
           retention-days: 30
