@@ -44,18 +44,22 @@ jobs:
   # firmware absent from jammy. Runs once, shared by all kernel/mode variants.
   # ---------------------------------------------------------------------------
   build-firmware:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     steps:
-      - name: Fetch amdnpu firmware from linux-firmware
+      - name: Fetch amdnpu firmware from upstream linux-firmware git
         run: |
-          mkdir -p fw-deb fw-extract amdnpu-firmware
-          cd fw-deb && apt-get download linux-firmware
-          dpkg-deb -x linux-firmware_*.deb ../fw-extract
-          fw_path="$(find ../fw-extract -type d -name amdnpu | head -n1)"
-          [[ -n "${fw_path}" ]] || { echo "ERROR: amdnpu not found in linux-firmware" >&2; exit 1; }
-          rsync -a "${fw_path}/" ../amdnpu-firmware/
-          dpkg-deb -f linux-firmware_*.deb Version > ../amdnpu-firmware/.pkg-version
-          echo "linux-firmware version: $(cat ../amdnpu-firmware/.pkg-version)"
+          mkdir -p amdnpu-firmware
+          git clone --depth 1 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git \
+            fw-git
+          [[ -d fw-git/amdnpu ]] \
+            || { echo "ERROR: amdnpu not found in linux-firmware git" >&2; exit 1; }
+          rsync -a fw-git/amdnpu/ amdnpu-firmware/
+          git -C fw-git log -1 --format='%H %ai' > amdnpu-firmware/.pkg-version
+          echo "linux-firmware commit: $(cat amdnpu-firmware/.pkg-version)"
+          echo "--- amdnpu firmware files ---"
+          find amdnpu-firmware -type f | sort
+          echo "-----------------------------"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -211,7 +215,7 @@ jobs:
   # ---------------------------------------------------------------------------
   package:
     needs: [prepare-matrix, build, build-firmware]
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     name: "package"
 
     steps:
