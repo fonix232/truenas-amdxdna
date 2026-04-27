@@ -132,13 +132,13 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Job 4: build
-  # Restores kernel headers from cache, builds amdxdna.ko, packages sysexts.
-  # Depends on prepare-headers (for the cache) and build-firmware (for the
-  # firmware artifact) — both run independently in parallel.
+  # Restores kernel headers from cache, clones xdna-driver, generates
+  # config_kernel.h, compiles amdxdna.ko. Uploads the .ko as an artifact
+  # for the downstream package job. No firmware dependency here.
   # Matrix: kernels × {production, debug}
   # ---------------------------------------------------------------------------
   build:
-    needs: [prepare-matrix, prepare-headers, build-firmware]
+    needs: [prepare-matrix, prepare-headers]
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -149,15 +149,12 @@ jobs:
     name: "build / ${{ matrix.kernel.truenas_tag }} / ${{ matrix.mode }}"
 
     steps:
-      - uses: actions/checkout@v6
-
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential flex git kmod \
-            libelf-dev libssl-dev make rsync \
-            squashfs-tools tar xz-utils
+            bc build-essential flex git kmod \
+            libelf-dev libssl-dev make
 
       - name: Restore kernel headers from cache
         uses: actions/cache/restore@v5
@@ -165,11 +162,6 @@ jobs:
           path: kernel-src
           key: truenas-kernel-headers-${{ matrix.kernel.truenas_tag }}-${{ matrix.mode }}-v11
           fail-on-cache-miss: true
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: amdxdna-firmware-files
-          path: amdnpu-firmware
 
       - name: Clone xdna-driver
         env:
@@ -184,13 +176,12 @@ jobs:
           KERNEL_VERSION: ${{ matrix.kernel.base_version }}-${{ matrix.mode }}+truenas
         run: |
           drv_src="src/amdxdna-dkms/drivers/accel/amdxdna"
-          configure_script="src/amdxdna-dkms/drivers/accel/tools/configure_kernel.sh"
           KERNEL_SRC="${GITHUB_WORKSPACE}/kernel-src" \
             KERNEL_VER="${KERNEL_VERSION}" \
             KBUILD_MODPOST_WARN=1 \
             KCFLAGS="-Wno-unused-variable" \
             OUT="${drv_src}/config_kernel.h" \
-            bash "${configure_script}"
+            bash "src/amdxdna-dkms/drivers/accel/tools/configure_kernel.sh"
 
       - name: Build amdxdna.ko
         env:
@@ -204,72 +195,120 @@ jobs:
             modules
           [[ -f "${drv_src}/amdxdna.ko" ]] || { echo "ERROR: amdxdna.ko not found" >&2; exit 1; }
 
-      - name: Assemble sysext images
+      - name: Upload kernel module artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: amdxdna-ko-${{ matrix.kernel.truenas_tag }}-${{ matrix.mode }}
+          path: src/amdxdna-dkms/drivers/accel/amdxdna/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 5: package
+  # Single job (no matrix) — downloads ALL ko artifacts and the firmware
+  # artifact, then loops over every kernel×mode combination to assemble sysext
+  # images and .run self-extractors. Re-run this job alone after installer or
+  # packaging changes without recompiling anything.
+  # ---------------------------------------------------------------------------
+  package:
+    needs: [prepare-matrix, build, build-firmware]
+    runs-on: ubuntu-24.04
+    name: "package"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rsync squashfs-tools tar
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: amdxdna-firmware-files
+          path: amdnpu-firmware
+
+      # Downloads all amdxdna-ko-* artifacts, each into its own subdirectory
+      # named after the artifact (e.g. amdxdna-ko-TS-26.0.0-BETA.1-production/)
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: amdxdna-ko-*
+          merge-multiple: false
+
+      - name: Assemble all sysext images and .run installers
         env:
-          KERNEL_VERSION: ${{ matrix.kernel.base_version }}-${{ matrix.mode }}+truenas
-          DKMS_REF: ${{ matrix.kernel.dkms_ref }}
+          MATRIX: ${{ needs.prepare-matrix.outputs.matrix }}
+          BUILD_RUN_ID: ${{ github.run_id }}
+          BUILD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          drv_src="src/amdxdna-dkms/drivers/accel/amdxdna"
-          base_krel="${KERNEL_VERSION%%+*}"
-          module_name="amdxdna-${base_krel}"
+          mkdir -p out work
           firmware_name="amdxdna-firmware"
-          mkdir -p out
+          fw_ver="$(cat amdnpu-firmware/.pkg-version 2>/dev/null || echo unknown)"
 
-          # --- Module sysext ---
-          mod_tree="work/sysext-module"
-          mkdir -p \
-            "${mod_tree}/usr/lib/modules/${KERNEL_VERSION}/kernel/drivers/accel/amdxdna" \
-            "${mod_tree}/usr/lib/extension-release.d"
-          install -m 0644 "${drv_src}/amdxdna.ko" \
-            "${mod_tree}/usr/lib/modules/${KERNEL_VERSION}/kernel/drivers/accel/amdxdna/amdxdna.ko"
-          printf 'ID=_any\nSYSEXT_SCOPE=system\nARCHITECTURE=x86-64\n' \
-            > "${mod_tree}/usr/lib/extension-release.d/extension-release.${module_name}"
-          mksquashfs "${mod_tree}" "out/${module_name}.raw" -comp xz -noappend -quiet
-
-          # --- Firmware sysext ---
+          # Firmware sysext — built once, shared by all kernel variants
           fw_tree="work/sysext-firmware"
-          mkdir -p \
-            "${fw_tree}/usr/lib/firmware/amdnpu" \
-            "${fw_tree}/usr/lib/extension-release.d"
+          mkdir -p "${fw_tree}/usr/lib/firmware/amdnpu" \
+                   "${fw_tree}/usr/lib/extension-release.d"
           rsync -a amdnpu-firmware/ "${fw_tree}/usr/lib/firmware/amdnpu/"
           printf 'ID=_any\nSYSEXT_SCOPE=system\nARCHITECTURE=x86-64\n' \
             > "${fw_tree}/usr/lib/extension-release.d/extension-release.${firmware_name}"
           mksquashfs "${fw_tree}" "out/${firmware_name}.raw" -comp xz -noappend -quiet
 
-          # --- .run self-extractor ---
-          pkg_ver="$(grep -m1 'XDNA_DRIVER_VERSION' "${drv_src}/Makefile" \
-            | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || echo '0.0.0')"
-          dkms_commit="$(git -C src/amdxdna-dkms rev-parse HEAD)"
-          fw_ver="$(cat amdnpu-firmware/.pkg-version 2>/dev/null || echo unknown)"
-          cat > out/metadata.env <<EOF
-          KERNEL_VERSION=${KERNEL_VERSION}
-          DKMS_REF=${DKMS_REF}
-          DKMS_COMMIT=${dkms_commit}
-          DKMS_VERSION=${pkg_ver}
-          FIRMWARE_PKG_VERSION=${fw_ver}
-          BUILD_RUN_ID=${{ github.run_id }}
-          BUILD_SHA=${{ github.sha }}
-          BUILD_TIME_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          EOF
+          echo "${MATRIX}" | jq -r '.[] | [.truenas_tag, .base_version, .dkms_ref] | @tsv' | \
+          while IFS=$'\t' read -r truenas_tag base_version dkms_ref; do
+            for mode in production debug; do
+              kver="${base_version}-${mode}+truenas"
+              base_krel="${kver%%+*}"
+              module_name="amdxdna-${base_krel}"
+              ko_dir="amdxdna-ko-${truenas_tag}-${mode}"
 
-          bundle_dir="work/bundle"
-          mkdir -p "${bundle_dir}"
-          cp "out/${module_name}.raw" "out/${firmware_name}.raw" out/metadata.env "${bundle_dir}/"
-          tar -C "${bundle_dir}" -czf work/bundle.tar.gz .
+              [[ -f "${ko_dir}/amdxdna.ko" ]] \
+                || { echo "ERROR: ${ko_dir}/amdxdna.ko not found" >&2; exit 1; }
 
-          installer="builder/installer-template.sh"
-          run_file="out/amdxdna-override-${KERNEL_VERSION}.run"
-          payload_line="$(($(wc -l < "${installer}") + 1))"
-          sed \
-            -e "s|__PAYLOAD_LINE__|${payload_line}|g" \
-            -e "s|__TARGET_KREL__|${KERNEL_VERSION}|g" \
-            "${installer}" > "${run_file}"
-          cat work/bundle.tar.gz >> "${run_file}"
-          chmod +x "${run_file}"
+              # Module sysext
+              mod_tree="work/sysext-module-${base_krel}"
+              mkdir -p \
+                "${mod_tree}/usr/lib/modules/${kver}/kernel/drivers/accel/amdxdna" \
+                "${mod_tree}/usr/lib/extension-release.d"
+              install -m 0644 "${ko_dir}/amdxdna.ko" \
+                "${mod_tree}/usr/lib/modules/${kver}/kernel/drivers/accel/amdxdna/amdxdna.ko"
+              printf 'ID=_any\nSYSEXT_SCOPE=system\nARCHITECTURE=x86-64\n' \
+                > "${mod_tree}/usr/lib/extension-release.d/extension-release.${module_name}"
+              mksquashfs "${mod_tree}" "out/${module_name}.raw" -comp xz -noappend -quiet
+
+              pkg_ver="$(grep -m1 'XDNA_DRIVER_VERSION' "${ko_dir}/Makefile" \
+                | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || echo '0.0.0')"
+
+              {
+                printf 'KERNEL_VERSION=%s\n'        "${kver}"
+                printf 'DKMS_REF=%s\n'              "${dkms_ref}"
+                printf 'DKMS_VERSION=%s\n'          "${pkg_ver}"
+                printf 'FIRMWARE_PKG_VERSION=%s\n'  "${fw_ver}"
+                printf 'BUILD_RUN_ID=%s\n'          "${BUILD_RUN_ID}"
+                printf 'BUILD_SHA=%s\n'             "${BUILD_SHA}"
+                printf 'BUILD_TIME_UTC=%s\n'        "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              } > "out/metadata-${base_krel}.env"
+
+              bundle_dir="work/bundle-${base_krel}"
+              mkdir -p "${bundle_dir}"
+              cp "out/${module_name}.raw" "out/${firmware_name}.raw" \
+                 "out/metadata-${base_krel}.env" "${bundle_dir}/"
+              tar -C "${bundle_dir}" -czf "work/bundle-${base_krel}.tar.gz" .
+
+              installer="builder/installer-template.sh"
+              run_file="out/amdxdna-override-${kver}.run"
+              payload_line="$(($(wc -l < "${installer}") + 1))"
+              sed \
+                -e "s|__PAYLOAD_LINE__|${payload_line}|g" \
+                -e "s|__TARGET_KREL__|${kver}|g" \
+                "${installer}" > "${run_file}"
+              cat "work/bundle-${base_krel}.tar.gz" >> "${run_file}"
+              chmod +x "${run_file}"
+            done
+          done
 
       - uses: actions/upload-artifact@v7
         with:
-          name: amdxdna-sysext-${{ matrix.kernel.truenas_tag }}-${{ matrix.mode }}
+          name: amdxdna-sysext
           path: out/
           retention-days: 30
