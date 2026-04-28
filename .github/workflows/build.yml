@@ -201,14 +201,63 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Job 5: package
+  # Job 5: build-rocm-tools
+  # Fetches rocm-smi (ROCm noble repo) + xrt-smi (AMD XRT PPA) + amdsmi Python
+  # wheel (PyPI cp312), assembles a single userspace sysext image and .run.
+  # Runs on ubuntu-24.04 (noble): ROCm 7.x targets noble (glibc 2.39).
+  # TrueNAS SCALE 26.x is Debian trixie (glibc 2.41) — satisfied.
+  # No kernel matrix dependency.
+  # ---------------------------------------------------------------------------
+  build-rocm-tools:
+    runs-on: ubuntu-24.04
+    name: "rocm-tools"
+    outputs:
+      rocm_version: ${{ steps.ver.outputs.rocm_version }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve ROCm version
+        id: ver
+        run: |
+          rocm_version="7.2"
+          echo "rocm_version=${rocm_version}" >> "$GITHUB_OUTPUT"
+          echo "Building rocm-tools for ROCm ${rocm_version}"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            dpkg-dev python3-pip squashfs-tools tar wget
+
+      - name: Fetch and stage packages
+        env:
+          ROCM_VERSION: ${{ steps.ver.outputs.rocm_version }}
+        working-directory: rocm-tools
+        run: bash builder/1_fetch_packages.sh
+
+      - name: Assemble sysext image and .run installer
+        env:
+          BUILD_RUN_ID: ${{ github.run_id }}
+          BUILD_SHA:    ${{ github.sha }}
+        working-directory: rocm-tools
+        run: bash builder/2_package.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rocm-tools-sysext
+          path: rocm-tools/out/*.run
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Job 6: package
   # Single job (no matrix) — downloads ALL ko artifacts and the firmware
   # artifact, then loops over every kernel×mode combination to assemble sysext
   # images and .run self-extractors. Re-run this job alone after installer or
   # packaging changes without recompiling anything.
   # ---------------------------------------------------------------------------
   package:
-    needs: [prepare-matrix, build, build-firmware]
+    needs: [prepare-matrix, build, build-firmware, build-rocm-tools]
     runs-on: ubuntu-24.04
     name: "package"
     permissions:
@@ -249,6 +298,12 @@ jobs:
           path: out/*.run
           retention-days: 30
 
+      - name: Download rocm-tools artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: rocm-tools-sysext
+          path: out/
+
       - name: Read xdna version
         id: ver
         run: echo "xdna_ver=$(cat out/version.txt)" >> "$GITHUB_OUTPUT"
@@ -277,12 +332,19 @@ jobs:
           tag_name: v${{ steps.ver.outputs.xdna_ver }}
           name: amdxdna ${{ steps.ver.outputs.xdna_ver }}
           body: |
-            AMD XDNA kernel module sysext for TrueNAS SCALE.
+            AMD XDNA kernel module + ROCm/XRT userspace tools sysext for TrueNAS SCALE.
+
             Built from [amd/xdna-driver](https://github.com/amd/xdna-driver) version ${{ steps.ver.outputs.xdna_ver }}.
 
-            ## Install
+            ## Install XDNA kernel module
             ```bash
             bash amdxdna-override-${{ steps.ver.outputs.xdna_ver }}.run
             ```
-            The installer auto-detects the running kernel and selects the correct module variant.
+            Auto-detects the running kernel and selects the correct module variant.
+
+            ## Install ROCm/XRT userspace tools
+            ```bash
+            bash rocm-tools-${{ needs.build-rocm-tools.outputs.rocm_version }}.run
+            ```
+            Provides `/usr/bin/rocm-smi` and `/usr/bin/xrt-smi` via `systemd-sysext`.
           files: out/*.run
