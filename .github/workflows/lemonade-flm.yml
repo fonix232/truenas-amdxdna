@@ -1,0 +1,89 @@
+name: Build lemonade-flm image
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+  push:
+    paths:
+      - 'lemonade-flm/Dockerfile'
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get latest Lemonade release
+        id: upstream
+        run: |
+          tag=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            https://api.github.com/repos/lemonade-sdk/lemonade/releases/latest \
+            | jq -r '.tag_name')
+          [[ -n "${tag}" && "${tag}" != "null" ]] \
+            || { echo "ERROR: could not determine Lemonade version" >&2; exit 1; }
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Latest Lemonade: ${tag}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if image already exists in GHCR
+        id: check
+        run: |
+          tag="${{ steps.upstream.outputs.tag }}"
+          # Always rebuild when triggered by a Dockerfile change,
+          # even if the versioned tag already exists.
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Dockerfile changed — forcing rebuild"
+          elif docker manifest inspect "ghcr.io/fonix232/lemonade-flm:${tag}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image ghcr.io/fonix232/lemonade-flm:${tag} already exists — skipping build"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Image not found — will build"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate OCI labels
+        if: steps.check.outputs.exists != 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/fonix232/lemonade-flm
+          labels: |
+            org.opencontainers.image.title=lemonade-flm
+            org.opencontainers.image.description=Lemonade Server with FastFlowLM NPU backend for AMD Ryzen AI (XDNA2).
+            org.opencontainers.image.vendor=fonix232
+            org.opencontainers.image.version=${{ steps.upstream.outputs.tag }}
+            org.opencontainers.image.source=https://github.com/fonix232/truenas-amdxdna/tree/main/lemonade-flm
+            org.opencontainers.image.url=https://github.com/lemonade-sdk/lemonade
+            org.opencontainers.image.documentation=https://github.com/lemonade-sdk/lemonade/blob/main/README.md
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push
+        if: steps.check.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: lemonade-flm
+          push: true
+          tags: |
+            ghcr.io/fonix232/lemonade-flm:${{ steps.upstream.outputs.tag }}
+            ghcr.io/fonix232/lemonade-flm:latest
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
