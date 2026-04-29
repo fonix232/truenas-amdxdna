@@ -58,15 +58,19 @@ echo "New packages installed: $(echo "${new_pkgs}" | wc -l)"
 # ── Capture installed files into staging/ ─────────────────────────────────
 # List all files owned by newly installed packages, filtered to /usr and /opt.
 # Excluding docs, headers, cmake, pkg-config, man pages, OpenCL ICD files.
-echo "${new_pkgs}" | xargs dpkg -L 2>/dev/null | sort -u \
+#
+# NOTE: the grep -vE pattern MUST be a single line — multi-line single-quoted
+# strings pass literal newlines into the regex, which GNU grep interprets as
+# empty alternation branches (matching the empty string), causing grep -v to
+# exclude every line and return exit code 1.
+echo "${new_pkgs}" | xargs -d $'\n' dpkg -L 2>/dev/null | sort -u \
   | grep -E '^(/usr|/opt)' \
-  | grep -vE '/share/(doc|man|lintian|bash-completion|cmake|pkgconfig)
-             |/include/
-             |\.gz$|NOTICE|changelog|copyright|TODO
-             |\.h$|\.md$
-             |example|OpenCL
-             |amd_smi/(example|setup\.py|pyproject)' \
-  > work/filelist.txt
+  | grep -vE '/share/(doc|man|lintian|bash-completion|cmake|pkgconfig)|/include/|\.gz$|NOTICE|changelog|copyright|TODO|\.h$|\.md$|example|OpenCL|amd_smi/(example|setup\.py|pyproject)' \
+  > work/filelist.txt || true
+
+file_count=$(wc -l < work/filelist.txt)
+echo "Files to stage: ${file_count}"
+[[ ${file_count} -gt 0 ]] || { echo "ERROR: filelist.txt is empty — no files captured from new packages" >&2; exit 1; }
 
 # rsync -aR preserves symlinks and permissions and uses the full path as relative source
 rsync -aR --files-from=work/filelist.txt / staging/
