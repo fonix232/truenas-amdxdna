@@ -20,38 +20,47 @@ ROCM_DIST="noble"
 
 mkdir -p staging work
 
+# Use sudo when not already root (GHA runner is non-root; Docker test container is root)
+if [[ "$(id -u)" -eq 0 ]]; then SUDO=""; else SUDO="sudo"; fi
+
+# ── Bootstrap tools ────────────────────────────────────────────────────────
+# On GHA ubuntu-24.04 these are pre-installed. On a bare container they may not be.
+${SUDO} apt-get update -qq
+${SUDO} apt-get install -y --no-install-recommends \
+  ca-certificates gnupg rsync wget >/dev/null
+
 # ── Set up repositories ────────────────────────────────────────────────────
 
-sudo mkdir -p /etc/apt/keyrings
+${SUDO} mkdir -p /etc/apt/keyrings
 
 # ROCm
 wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key \
-  | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+  | gpg --dearmor | ${SUDO} tee /etc/apt/keyrings/rocm.gpg > /dev/null
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] \
 https://repo.radeon.com/rocm/apt/${ROCM_VERSION} ${ROCM_DIST} main" \
-  | sudo tee /etc/apt/sources.list.d/rocm.list
+  | ${SUDO} tee /etc/apt/sources.list.d/rocm.list
 
 # XRT PPA (key fingerprint from https://launchpad.net/~amd-team/+archive/ubuntu/xrt)
 XRT_PPA_KEY="F83FE7BE8F1A44E83CDA3625D47169167A18444E"
 wget -qO - "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${XRT_PPA_KEY}" \
-  | gpg --dearmor | sudo tee /etc/apt/keyrings/xrt.gpg > /dev/null
+  | gpg --dearmor | ${SUDO} tee /etc/apt/keyrings/xrt.gpg > /dev/null
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/xrt.gpg] \
 https://ppa.launchpadcontent.net/amd-team/xrt/ubuntu ${ROCM_DIST} main" \
-  | sudo tee /etc/apt/sources.list.d/xrt.list
+  | ${SUDO} tee /etc/apt/sources.list.d/xrt.list
 
-sudo apt-get update -qq
+${SUDO} apt-get update -qq
 
 # ── Install packages ──────────────────────────────────────────────────────
 # Record what is installed before so we can identify newly added packages
 # (including transitive deps) and capture exactly those files.
 
-dpkg-query -f '\${Package}\n' -W | sort > work/before.txt
+dpkg-query -f '${Package}\n' -W | sort > work/before.txt
 
-sudo apt-get install -y --no-install-recommends \
+${SUDO} apt-get install -y --no-install-recommends \
   rocm-smi-lib amd-smi-lib libxrt-utils libxrt-npu2 libxrt2 2>&1 \
   | grep -E '^(Setting up|E:)'
 
-dpkg-query -f '\${Package}\n' -W | sort > work/after.txt
+dpkg-query -f '${Package}\n' -W | sort > work/after.txt
 new_pkgs=$(comm -13 work/before.txt work/after.txt)
 echo "New packages installed: $(echo "${new_pkgs}" | wc -l)"
 
@@ -59,11 +68,16 @@ echo "New packages installed: $(echo "${new_pkgs}" | wc -l)"
 # List all files owned by newly installed packages, filtered to /usr and /opt.
 # Excluding docs, headers, cmake, pkg-config, man pages, OpenCL ICD files.
 #
-# NOTE: the grep -vE pattern MUST be a single line — multi-line single-quoted
-# strings pass literal newlines into the regex, which GNU grep interprets as
-# empty alternation branches (matching the empty string), causing grep -v to
-# exclude every line and return exit code 1.
-echo "${new_pkgs}" | xargs -d $'\n' dpkg -L 2>/dev/null | sort -u \
+# Use a while-read loop instead of echo|xargs to avoid the empty-string-arg
+# problem: command substitution strips trailing newlines, then echo re-adds
+# one, so `xargs -d $'\n'` would pass 9 packages + 1 empty string.
+# `dpkg -L ""` exits non-zero with no output, making the whole pipe empty.
+{
+  while IFS= read -r pkg; do
+    [[ -z "$pkg" ]] && continue
+    dpkg -L "$pkg" 2>/dev/null
+  done <<< "${new_pkgs}"
+} | sort -u \
   | grep -E '^(/usr|/opt)' \
   | grep -vE '/share/(doc|man|lintian|bash-completion|cmake|pkgconfig)|/include/|\.gz$|NOTICE|changelog|copyright|TODO|\.h$|\.md$|example|OpenCL|amd_smi/(example|setup\.py|pyproject)' \
   > work/filelist.txt || true
@@ -87,8 +101,8 @@ if [[ -L /opt/rocm ]]; then
 fi
 
 # Capture package versions for metadata
-rocm_ver_full=$(dpkg-query -f '\${Version}' -W rocm-smi-lib 2>/dev/null || echo "${ROCM_VERSION}.unknown")
-xrt_ver_full=$(dpkg-query  -f '\${Version}' -W libxrt-utils  2>/dev/null || echo "unknown")
+rocm_ver_full=$(dpkg-query -f '${Version}' -W rocm-smi-lib 2>/dev/null || echo "${ROCM_VERSION}.unknown")
+xrt_ver_full=$(dpkg-query  -f '${Version}' -W libxrt-utils  2>/dev/null || echo "unknown")
 
 # ── PATH wrapper scripts ───────────────────────────────────────────────────
 # rocm-smi and amd-smi install to /opt/rocm/bin/, not /usr/bin/.
