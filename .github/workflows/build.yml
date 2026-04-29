@@ -4,19 +4,33 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '0 3 * * *'   # 03:00 UTC daily — nightly builds
   workflow_dispatch:
     inputs:
       single_version:
-        description: "Build only this TrueNAS tag (e.g. TS-26.0.0-BETA.1). Leave blank for all."
+        description: "Build only this TrueNAS tag/branch (e.g. TS-26.0.0-BETA.1). Leave blank for all."
         required: false
         default: ""
+      include_nightly:
+        description: "Include nightly (branch-based) entries from kernels.json"
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   # ---------------------------------------------------------------------------
   # Job 1: prepare-matrix
   # Reads kernels.json and emits a matrix of {truenas_tag, base_version,
-  # dkms_ref}. Mode (production/debug) is added as a separate matrix axis
-  # in each downstream job, so every kernel gets both builds automatically.
+  # dkms_ref, kernel_sha}. Mode (production/debug) is added as a separate
+  # matrix axis in each downstream job.
+  #
+  # kernel_sha: resolved HEAD SHA for each truenas_tag.  For immutable tags
+  # this is a no-op; for branch refs (nightly builds) it advances with the
+  # branch, ensuring the kernel-headers cache never returns stale results.
+  #
+  # nightly entries (nightly: true in kernels.json) are only included on
+  # scheduled runs or when include_nightly is set on workflow_dispatch.
   # ---------------------------------------------------------------------------
   prepare-matrix:
     runs-on: ubuntu-24.04
@@ -29,14 +43,54 @@ jobs:
         id: set
         env:
           SINGLE_VERSION: ${{ inputs.single_version }}
+          EVENT_NAME: ${{ github.event_name }}
+          INCLUDE_NIGHTLY: ${{ inputs.include_nightly }}
         run: |
-          expanded=$(jq -c '[.[] | {base_version, truenas_tag, dkms_ref: (.dkms_ref // "main")}]' kernels.json)
+          expanded=$(jq -c '[.[] | {base_version: (.base_version // ""), truenas_tag, slug: (.truenas_tag | gsub("/"; "-")), dkms_ref: (.dkms_ref // "main"), nightly: (.nightly // false)}]' kernels.json)
+
+          # Nightly (branch-based) entries are only built on schedule or when
+          # explicitly requested via workflow_dispatch.
+          if [[ "${EVENT_NAME}" != "schedule" ]] && [[ "${INCLUDE_NIGHTLY}" != "true" ]]; then
+            expanded=$(echo "${expanded}" | jq -c '[.[] | select(.nightly == false)]')
+          fi
+
           if [[ -n "${SINGLE_VERSION}" ]]; then
             expanded=$(echo "${expanded}" | jq -c --arg v "${SINGLE_VERSION}" '[.[] | select(.truenas_tag == $v)]')
             [[ "$(echo "${expanded}" | jq 'length')" -gt 0 ]] \
               || { echo "ERROR: '${SINGLE_VERSION}' not found in kernels.json" >&2; exit 1; }
           fi
-          echo "matrix=${expanded}" >> "$GITHUB_OUTPUT"
+
+          # Resolve each truenas_tag to a git SHA. Lightweight ls-remote — no
+          # clone. Tries refs/tags/ first (tagged releases), then refs/heads/
+          # (branch refs for nightly builds). Falls back to the ref itself so
+          # the job still produces output even if the remote is unreachable.
+          resolved="[]"
+          while IFS= read -r entry; do
+            ref=$(echo "${entry}" | jq -r '.truenas_tag')
+            sha=$(git ls-remote https://github.com/truenas/linux \
+              "refs/tags/${ref}" "refs/heads/${ref}" 2>/dev/null | head -1 | cut -f1)
+            sha="${sha:-${ref}}"
+            entry=$(echo "${entry}" | jq -c --arg sha "${sha}" '. + {kernel_sha: $sha}')
+
+            # Auto-detect base_version for nightly entries that omit it.
+            # Fetches just the first 10 lines of the kernel Makefile using the
+            # resolved SHA — unambiguous even for branch names with slashes.
+            if [[ "$(echo "${entry}" | jq -r '.base_version')" == "" ]]; then
+              makefile=$(curl -fsSL \
+                "https://raw.githubusercontent.com/truenas/linux/${sha}/Makefile" \
+                2>/dev/null | head -10)
+              ver=$(echo "${makefile}" | awk '/^VERSION[[:space:]]*=/{print $3}')
+              pl=$(echo  "${makefile}" | awk '/^PATCHLEVEL[[:space:]]*=/{print $3}')
+              sl=$(echo  "${makefile}" | awk '/^SUBLEVEL[[:space:]]*=/{print $3}')
+              base_version="${ver}.${pl}.${sl}"
+              echo "Auto-detected base_version=${base_version} for ${ref}" >&2
+              entry=$(echo "${entry}" | jq -c --arg bv "${base_version}" '.base_version = $bv')
+            fi
+
+            resolved=$(echo "${resolved}" | jq -c --argjson e "${entry}" '. + [$e]')
+          done < <(echo "${expanded}" | jq -c '.[]')
+
+          echo "matrix=${resolved}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Job 2: build-firmware
@@ -119,7 +173,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: kernel-src
-          key: truenas-kernel-headers-${{ matrix.kernel.truenas_tag }}-${{ matrix.mode }}-v11
+          key: truenas-kernel-headers-${{ matrix.kernel.kernel_sha }}-${{ matrix.mode }}-v11
 
       - name: Clone and prepare kernel source
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -158,72 +212,54 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: kernel-src
-          key: truenas-kernel-headers-${{ matrix.kernel.truenas_tag }}-${{ matrix.mode }}-v11
+          key: truenas-kernel-headers-${{ matrix.kernel.kernel_sha }}-${{ matrix.mode }}-v11
           fail-on-cache-miss: true
 
-      - name: Clone xdna-driver
-        env:
-          DKMS_REF: ${{ matrix.kernel.dkms_ref }}
+      - name: Fetch amdxdna-dkms source
         run: |
-          git clone --depth 1 --branch "${DKMS_REF}" \
-            https://github.com/amd/xdna-driver src/amdxdna-dkms || \
-          git clone --depth 1 https://github.com/amd/xdna-driver src/amdxdna-dkms
-
-      - name: Generate config_kernel.h
-        env:
-          KERNEL_VERSION: ${{ matrix.kernel.base_version }}-${{ matrix.mode }}+truenas
-        run: |
-          drv_src="src/amdxdna-dkms/drivers/accel/amdxdna"
-          KERNEL_SRC="${GITHUB_WORKSPACE}/kernel-src" \
-            KERNEL_VER="${KERNEL_VERSION}" \
-            KBUILD_MODPOST_WARN=1 \
-            KCFLAGS="-Wno-unused-variable" \
-            OUT="${drv_src}/config_kernel.h" \
-            bash "src/amdxdna-dkms/drivers/accel/tools/configure_kernel.sh"
+          # Download the lemonade-team dkms source package directly from the
+          # XRT PPA. This gives us a proper PACKAGE_VERSION (7.0.0-rc1+...)
+          # that becomes the MODULE_VERSION string, so tools like flm validate
+          # accept the module. We extract from the .deb without adding the
+          # noble PPA to the build runner (ubuntu-22.04).
+          DKMS_DEB="https://ppa.launchpadcontent.net/amd-team/xrt/ubuntu/pool/main/a/amdxdna-dkms/amdxdna-dkms_7.0.0-rc1+git20260310.6b13cb8f4-noble1_amd64.deb"
+          wget -q "${DKMS_DEB}" -O /tmp/amdxdna-dkms.deb
+          dpkg-deb -x /tmp/amdxdna-dkms.deb /tmp/amdxdna-dkms-extracted/
+          mkdir -p src
+          SRCDIR=$(find /tmp/amdxdna-dkms-extracted/usr/src/ -maxdepth 1 -mindepth 1 -type d | head -1)
+          ln -s "${SRCDIR}" src/amdxdna-dkms
+          echo "Using dkms source: ${SRCDIR}"
 
       - name: Build amdxdna.ko
         env:
           KERNEL_VERSION: ${{ matrix.kernel.base_version }}-${{ matrix.mode }}+truenas
         run: |
-          drv_src="src/amdxdna-dkms/drivers/accel/amdxdna"
+          # The lemonade-team dkms source is flat: all .c files directly in
+          # the package dir (no drivers/accel/amdxdna/ subdirectory).
+          drv_src="src/amdxdna-dkms"
           drv_c="${drv_src}/amdxdna_pci_drv.c"
 
-          # MODULE_VERSION() is hardcoded in the C source and does not track
-          # AMDXDNA_DRIVER_MAJOR/MINOR. Patch it to the real value so that
-          # tools like flm validate see the correct version string.
-          xdna_major=$(grep -m1 'define[[:space:]]\+AMDXDNA_DRIVER_MAJOR' "${drv_c}" | grep -oP '\d+$')
-          xdna_minor=$(grep -m1 'define[[:space:]]\+AMDXDNA_DRIVER_MINOR' "${drv_c}" | grep -oP '\d+$')
-          xdna_modver="${xdna_major}.${xdna_minor}"
-          sed -i "s/MODULE_VERSION(\"[^\"]*\")/MODULE_VERSION(\"${xdna_modver}\")/" "${drv_c}"
-          echo "Patched MODULE_VERSION to ${xdna_modver}"
+          # Extract PACKAGE_VERSION from dkms.conf and inject MODULE_VERSION.
+          # The lemonade-team source has no MODULE_VERSION() in the C file;
+          # we append it so that tools like flm validate see the correct string.
+          xdna_modver=$(grep '^PACKAGE_VERSION=' "${drv_src}/dkms.conf" \
+            | sed 's/PACKAGE_VERSION="\(.*\)"/\1/')
+          sed -i '/^MODULE_DESCRIPTION/a MODULE_VERSION("'"${xdna_modver}"'");' "${drv_c}"
+          echo "Injected MODULE_VERSION(\"${xdna_modver}\")"
           echo "${xdna_modver}" > "${drv_src}/module_version.txt"
-
-          # Fix: amdxdna_sva_fini must be called before mmdrop(client->mm).
-          # When FLM terminates dirty (SIGKILL / container stop), mm_users has
-          # already reached zero by the time DRM close runs. mmdrop then drops
-          # mm_count to zero and frees mm_struct, so the subsequent
-          # iommu_sva_unbind_device call traverses freed mm IOMMU SVA list
-          # entries, triggering a general protection fault (kernel panic).
-          # Swapping the two calls keeps the mm alive across the SVA unbind.
-          perl -i -0pe \
-            's/(\tmmdrop\(client->mm\);)(\n\tamdxdna_sva_fini\(client\);)/$2$1/' \
-            "${drv_c}"
-          grep -q 'amdxdna_sva_fini(client)' "${drv_c}" \
-            || { echo "ERROR: SVA ordering patch was not applied to ${drv_c}" >&2; exit 1; }
-          echo "Applied amdxdna_client_cleanup SVA-before-mmdrop fix"
 
           KBUILD_MODPOST_WARN=1 make -C "${GITHUB_WORKSPACE}/kernel-src" \
             M="${GITHUB_WORKSPACE}/${drv_src}" \
-            CFLAGS_MODULE="-DAMDXDNA_DEVEL" \
-            OFT_CONFIG_AMDXDNA_PCI=y \
             modules
           [[ -f "${drv_src}/amdxdna.ko" ]] || { echo "ERROR: amdxdna.ko not found" >&2; exit 1; }
 
       - name: Upload kernel module artifact
         uses: actions/upload-artifact@v7
         with:
-          name: amdxdna-ko-${{ matrix.kernel.truenas_tag }}-${{ matrix.mode }}
-          path: src/amdxdna-dkms/drivers/accel/amdxdna/
+          name: amdxdna-ko-${{ matrix.kernel.slug }}-${{ matrix.mode }}
+          path: |
+            src/amdxdna-dkms/amdxdna.ko
+            src/amdxdna-dkms/module_version.txt
           retention-days: 7
 
   # ---------------------------------------------------------------------------

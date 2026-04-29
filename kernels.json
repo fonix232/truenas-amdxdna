@@ -2,6 +2,11 @@
   {
     "base_version": "6.18.13",
     "truenas_tag": "TS-26.0.0-BETA.1",
-    "dkms_ref": "main"
+    "dkms_ref": "7.0.0-rc1+git20260310.6b13cb8f4"
+  },
+  {
+    "truenas_tag": "truenas/linux-6.18",
+    "dkms_ref": "7.0.0-rc1+git20260310.6b13cb8f4",
+    "nightly": true
   }
 ]
