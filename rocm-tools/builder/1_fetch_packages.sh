@@ -50,12 +50,18 @@ apt-get download rocm-smi-lib amd-smi-lib
 dpkg-deb --extract rocm-smi-lib_*.deb  rocm-smi-lib
 dpkg-deb --extract amd-smi-lib_*.deb   amd-smi-lib
 
-# The rocm-smi CLI script (Python entry point)
-rocm_smi_script=$(find rocm-smi-lib/opt -name 'rocm-smi' -type f | head -1)
-[[ -n "${rocm_smi_script}" ]] \
-  || { echo "ERROR: rocm-smi script not found in rocm-smi-lib" >&2; exit 1; }
-install -D -m 0755 "${rocm_smi_script}" ../staging/usr/lib/rocm-tools/bin/rocm-smi
-echo "rocm-smi script: ${rocm_smi_script}"
+# The rocm-smi CLI moved to libexec/rocm_smi/rocm_smi.py in ROCm 7.x (was a standalone script).
+# Copy the entire libexec/rocm_smi/ dir so helper modules (rsmiBindings*.py) are alongside it.
+rocm_smi_dir=$(find rocm-smi-lib/opt -type d -name 'rocm_smi' -path '*/libexec/*' | head -1)
+[[ -n "${rocm_smi_dir}" ]] \
+  || { echo "ERROR: rocm_smi dir not found in rocm-smi-lib" >&2; exit 1; }
+[[ -f "${rocm_smi_dir}/rocm_smi.py" ]] \
+  || { echo "ERROR: rocm_smi.py not found in ${rocm_smi_dir}" >&2; exit 1; }
+install -D -m 0755 "${rocm_smi_dir}/rocm_smi.py" ../staging/usr/lib/rocm-tools/bin/rocm-smi
+find "${rocm_smi_dir}" -name '*.py' ! -name 'rocm_smi.py' | while read -r f; do
+  install -D -m 0644 "${f}" "../staging/usr/lib/rocm-tools/bin/$(basename "${f}")"
+done
+echo "rocm-smi: ${rocm_smi_dir}"
 
 # libamd_smi.so — required by the amdsmi Python extension at import time
 find amd-smi-lib/opt -name 'libamd_smi.so*' | while read -r lib; do
@@ -79,39 +85,46 @@ done
 
 popd > /dev/null
 
-# ── amdsmi Python wheel (cp311 — matches TrueNAS Python 3.11) ─────────────
+# ── amdsmi Python package ─────────────────────────────────────────────────
 #
-# The wheel tag is linux_x86_64 compiled on jammy (glibc 2.35), which works
-# on TrueNAS bookworm (glibc 2.36).  We pin the major version to ROCM_VERSION
-# so Python bindings and the C library stay in sync.
+# Since ROCm 7.x the amdsmi Python package is bundled inside amd-smi-lib at
+# share/amd_smi/amdsmi/. Use that directly; fall back to pip only if absent.
 
-pip3 install --quiet --upgrade pip
-pip3 download "amdsmi~=${ROCM_VERSION}.0" \
-  --python-version "${PYTHON_VERSION}" \
-  --platform linux_x86_64 \
-  --only-binary=:all: \
-  --no-deps \
-  -d work/amdsmi-wheel
+amdsmi_bundled=$(find work/amd-smi-lib/opt -type d -name 'amdsmi' -path '*/share/*' | head -1)
+if [[ -n "${amdsmi_bundled}" ]]; then
+  cp -a "${amdsmi_bundled}" \
+    "staging/usr/lib/rocm-tools/lib/python${PYTHON_VERSION}/site-packages/amdsmi"
+  echo "amdsmi Python package: bundled from amd-smi-lib (${amdsmi_bundled})"
+else
+  echo "amdsmi not bundled in amd-smi-lib; falling back to pip download"
+  pip3 install --quiet --upgrade pip
+  pip3 download "amdsmi~=${ROCM_VERSION}.0" \
+    --python-version "${PYTHON_VERSION}" \
+    --platform linux_x86_64 \
+    --only-binary=:all: \
+    --no-deps \
+    -d work/amdsmi-wheel
 
-amdsmi_whl=$(find work/amdsmi-wheel -name "amdsmi-*.whl" | head -1)
-[[ -n "${amdsmi_whl}" ]] \
-  || { echo "ERROR: amdsmi cp${PYTHON_VERSION//./} wheel not found on PyPI for ~=${ROCM_VERSION}.0" >&2; exit 1; }
-echo "amdsmi wheel: $(basename "${amdsmi_whl}")"
+  amdsmi_whl=$(find work/amdsmi-wheel -name "amdsmi-*.whl" | head -1)
+  [[ -n "${amdsmi_whl}" ]] \
+    || { echo "ERROR: amdsmi wheel not found on PyPI for ~=${ROCM_VERSION}.0" >&2; exit 1; }
+  echo "amdsmi wheel: $(basename "${amdsmi_whl}")"
 
-mkdir -p work/amdsmi-extract
-python3 -m zipfile -e "${amdsmi_whl}" work/amdsmi-extract
+  mkdir -p work/amdsmi-extract
+  python3 -m zipfile -e "${amdsmi_whl}" work/amdsmi-extract
 
-amdsmi_pkg=$(find work/amdsmi-extract -maxdepth 1 -type d -name 'amdsmi' | head -1)
-[[ -n "${amdsmi_pkg}" ]] \
-  || { echo "ERROR: amdsmi package directory not found in wheel" >&2; exit 1; }
+  amdsmi_pkg=$(find work/amdsmi-extract -maxdepth 1 -type d -name 'amdsmi' | head -1)
+  [[ -n "${amdsmi_pkg}" ]] \
+    || { echo "ERROR: amdsmi package directory not found in wheel" >&2; exit 1; }
 
-cp -a "${amdsmi_pkg}" \
-  "staging/usr/lib/rocm-tools/lib/python${PYTHON_VERSION}/site-packages/amdsmi"
+  cp -a "${amdsmi_pkg}" \
+    "../staging/usr/lib/rocm-tools/lib/python${PYTHON_VERSION}/site-packages/amdsmi"
 
-# dist-info (optional; allows pip list / importlib.metadata to see it)
-find work/amdsmi-extract -maxdepth 1 -type d -name 'amdsmi-*.dist-info' \
-  -exec cp -a {} "staging/usr/lib/rocm-tools/lib/python${PYTHON_VERSION}/site-packages/" \; \
-  2>/dev/null || true
+  # dist-info (optional; allows pip list / importlib.metadata to see it)
+  find work/amdsmi-extract -maxdepth 1 -type d -name 'amdsmi-*.dist-info' \
+    -exec cp -a {} "../staging/usr/lib/rocm-tools/lib/python${PYTHON_VERSION}/site-packages/" \; \
+    2>/dev/null || true
+fi
 
 # ── XRT (xrt-smi) ──────────────────────────────────────────────────────────
 

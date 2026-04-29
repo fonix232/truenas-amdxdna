@@ -186,6 +186,18 @@ jobs:
           KERNEL_VERSION: ${{ matrix.kernel.base_version }}-${{ matrix.mode }}+truenas
         run: |
           drv_src="src/amdxdna-dkms/drivers/accel/amdxdna"
+          drv_c="${drv_src}/amdxdna_pci_drv.c"
+
+          # MODULE_VERSION() is hardcoded in the C source and does not track
+          # AMDXDNA_DRIVER_MAJOR/MINOR. Patch it to the real value so that
+          # tools like flm validate see the correct version string.
+          xdna_major=$(grep -m1 'define[[:space:]]\+AMDXDNA_DRIVER_MAJOR' "${drv_c}" | grep -oP '\d+$')
+          xdna_minor=$(grep -m1 'define[[:space:]]\+AMDXDNA_DRIVER_MINOR' "${drv_c}" | grep -oP '\d+$')
+          xdna_modver="${xdna_major}.${xdna_minor}"
+          sed -i "s/MODULE_VERSION(\"[^\"]*\")/MODULE_VERSION(\"${xdna_modver}\")/" "${drv_c}"
+          echo "Patched MODULE_VERSION to ${xdna_modver}"
+          echo "${xdna_modver}" > "${drv_src}/module_version.txt"
+
           KBUILD_MODPOST_WARN=1 make -C "${GITHUB_WORKSPACE}/kernel-src" \
             M="${GITHUB_WORKSPACE}/${drv_src}" \
             CFLAGS_MODULE="-DAMDXDNA_DEVEL" \

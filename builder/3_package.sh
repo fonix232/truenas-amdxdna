@@ -24,13 +24,13 @@ set -euo pipefail
 
 mkdir -p out work
 
-# Extract xdna driver version from the first available artifact Makefile.
+# Extract xdna driver version from the first available artifact module_version.txt.
+# This file is written by the build step from AMDXDNA_DRIVER_MAJOR/MINOR in the C source.
 # All artifacts come from the same xdna-driver ref so the version is identical.
 xdna_ver=""
 for _d in amdxdna-ko-*/; do
-  if [[ -f "${_d}Makefile" ]]; then
-    xdna_ver=$(grep -m1 'XDNA_DRIVER_VERSION' "${_d}Makefile" \
-      | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  if [[ -f "${_d}module_version.txt" ]]; then
+    xdna_ver=$(cat "${_d}module_version.txt")
     break
   fi
 done
@@ -76,8 +76,7 @@ while IFS=$'\t' read -r truenas_tag base_version dkms_ref; do
       > "${mod_tree}/usr/lib/extension-release.d/extension-release.${module_name}"
     mksquashfs "${mod_tree}" "${bundle_dir}/${module_name}.raw" -comp xz -noappend -quiet
 
-    pkg_ver="$(grep -m1 'XDNA_DRIVER_VERSION' "${ko_dir}/Makefile" \
-      | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || echo '0.0.0')"
+pkg_ver="$(cat "${ko_dir}/module_version.txt" 2>/dev/null || echo '0.0.0')"
 
     {
       printf 'KERNEL_VERSION=%s\n'        "${kver}"
