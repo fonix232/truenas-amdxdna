@@ -43,37 +43,15 @@ SYSEXT_NAME="rocm-tools"
 sysext_tree="work/sysext/${SYSEXT_NAME}"
 mkdir -p "${sysext_tree}/usr/lib/extension-release.d"
 
-# Copy staged usr/ tree (bin/ and lib/ subdirs)
-cp -a staging/usr/bin          "${sysext_tree}/usr/"
-cp -a staging/usr/lib/rocm-tools "${sysext_tree}/usr/lib/"
-cp -a staging/usr/lib/xrt        "${sysext_tree}/usr/lib/"
-
-# ── /usr/bin wrapper scripts (generated here, not fetched) ────────────────
-
-PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
-
-# rocm-smi: sets PYTHONPATH and LD_LIBRARY_PATH, then delegates to the script
-cat > "${sysext_tree}/usr/bin/rocm-smi" <<'WRAPPER'
-#!/bin/bash
-# rocm-smi wrapper — provided by rocm-tools sysext
-export PYTHONPATH=/usr/lib/rocm-tools/lib/python__PYVER__/site-packages${PYTHONPATH:+:$PYTHONPATH}
-export LD_LIBRARY_PATH=/usr/lib/rocm-tools/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-exec python3 /usr/lib/rocm-tools/bin/rocm-smi "$@"
-WRAPPER
-sed -i "s/__PYVER__/${PYTHON_VERSION}/g" "${sysext_tree}/usr/bin/rocm-smi"
-chmod 0755 "${sysext_tree}/usr/bin/rocm-smi"
-
-# xrt-smi: sets LD_LIBRARY_PATH to find XRT runtime libs, delegates to binary
-cat > "${sysext_tree}/usr/bin/xrt-smi" <<'WRAPPER'
-#!/bin/bash
-# xrt-smi wrapper — provided by rocm-tools sysext
-export LD_LIBRARY_PATH=/usr/lib/xrt/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-exec /usr/lib/xrt/bin/xrt-smi "$@"
-WRAPPER
-chmod 0755 "${sysext_tree}/usr/bin/xrt-smi"
+# Copy staged trees at their native paths.
+# staging/usr/  → sysext /usr/   (xrt-smi binary + libs, wrapper scripts)
+# staging/opt/  → sysext /opt/   (rocm-smi, amd-smi and all ROCm libs)
+cp -a staging/usr/. "${sysext_tree}/usr/"
+[[ -d staging/opt ]] && cp -a staging/opt/. "${sysext_tree}/opt/"
 
 # ── extension-release file ─────────────────────────────────────────────────
-# ID=_any makes the sysext compatible with any OS (TrueNAS, stock Debian, etc.)
+# ID=_any makes the sysext compatible with any OS.
+# SYSEXT_SCOPE=system covers both /usr and /opt hierarchies.
 
 printf 'ID=_any\nSYSEXT_SCOPE=system\nARCHITECTURE=x86-64\n' \
   > "${sysext_tree}/usr/lib/extension-release.d/extension-release.${SYSEXT_NAME}"

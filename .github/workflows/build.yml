@@ -198,6 +198,20 @@ jobs:
           echo "Patched MODULE_VERSION to ${xdna_modver}"
           echo "${xdna_modver}" > "${drv_src}/module_version.txt"
 
+          # Fix: amdxdna_sva_fini must be called before mmdrop(client->mm).
+          # When FLM terminates dirty (SIGKILL / container stop), mm_users has
+          # already reached zero by the time DRM close runs. mmdrop then drops
+          # mm_count to zero and frees mm_struct, so the subsequent
+          # iommu_sva_unbind_device call traverses freed mm IOMMU SVA list
+          # entries, triggering a general protection fault (kernel panic).
+          # Swapping the two calls keeps the mm alive across the SVA unbind.
+          perl -i -0pe \
+            's/(\tmmdrop\(client->mm\);)(\n\tamdxdna_sva_fini\(client\);)/$2$1/' \
+            "${drv_c}"
+          grep -q 'amdxdna_sva_fini(client)' "${drv_c}" \
+            || { echo "ERROR: SVA ordering patch was not applied to ${drv_c}" >&2; exit 1; }
+          echo "Applied amdxdna_client_cleanup SVA-before-mmdrop fix"
+
           KBUILD_MODPOST_WARN=1 make -C "${GITHUB_WORKSPACE}/kernel-src" \
             M="${GITHUB_WORKSPACE}/${drv_src}" \
             CFLAGS_MODULE="-DAMDXDNA_DEVEL" \
@@ -240,7 +254,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            dpkg-dev python3-pip squashfs-tools tar wget
+            rsync squashfs-tools tar wget
 
       - name: Fetch and stage packages
         env:
