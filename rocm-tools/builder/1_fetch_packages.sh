@@ -127,38 +127,57 @@ else
 fi
 
 # ── XRT (xrt-smi) ──────────────────────────────────────────────────────────
+#
+# amd-team/xrt PPA ships three packages for amd64:
+#   libxrt-utils  - xrt-smi binary
+#   libxrt2       - core runtime shared libraries
+#   libxrt-npu2   - NPU/XDNA driver plugin and XDP modules
+#
+# Key fingerprint sourced from: https://launchpad.net/~amd-team/+archive/ubuntu/xrt
+XRT_PPA_KEY="F83FE7BE8F1A44E83CDA3625D47169167A18444E"
+XRT_PPA_URL="https://ppa.launchpadcontent.net/amd-team/xrt/ubuntu"
 
-sudo add-apt-repository -y ppa:amd-team/xrt
+sudo mkdir -p /etc/apt/keyrings
+wget -qO - "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${XRT_PPA_KEY}" \
+  | gpg --dearmor \
+  | sudo tee /etc/apt/keyrings/xrt.gpg > /dev/null
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/xrt.gpg] ${XRT_PPA_URL} ${ROCM_DIST} main" \
+  | sudo tee /etc/apt/sources.list.d/xrt.list
 sudo apt-get update -qq
 
 pushd work > /dev/null
 
-apt-get download xrt
+apt-get download libxrt-utils libxrt-npu2 libxrt2
 
-dpkg-deb --extract xrt_*.deb xrt
+dpkg-deb --extract libxrt-utils_*.deb libxrt-utils
+dpkg-deb --extract libxrt-npu2_*.deb  libxrt-npu2
+dpkg-deb --extract libxrt2_*.deb      libxrt2
 
-xrt_smi=$(find xrt/opt -name 'xrt-smi' -type f | head -1)
-[[ -n "${xrt_smi}" ]] \
-  || { echo "ERROR: xrt-smi binary not found in xrt package" >&2; exit 1; }
-install -D -m 0755 "${xrt_smi}" ../staging/usr/lib/xrt/bin/xrt-smi
-echo "xrt-smi binary: ${xrt_smi}"
+# xrt-smi binary (lives in /usr/bin/ since ROCm 7.x, not under /opt/)
+install -D -m 0755 libxrt-utils/usr/bin/xrt-smi ../staging/usr/lib/xrt/bin/xrt-smi
+echo "xrt-smi: libxrt-utils/usr/bin/xrt-smi"
 
-# XRT runtime shared libraries (everything in the xrt lib directory)
-xrt_lib_dir=$(find xrt/opt -mindepth 2 -maxdepth 2 -type d -name 'lib' | head -1)
-if [[ -n "${xrt_lib_dir}" ]]; then
-  find "${xrt_lib_dir}" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) | while read -r lib; do
-    dest="../staging/usr/lib/xrt/lib/$(basename "${lib}")"
+# Core runtime libs (libxrt2) + NPU driver + XDP modules (libxrt-npu2)
+_stage_libs() {
+  local src_dir="$1" dest_dir="$2"
+  mkdir -p "${dest_dir}"
+  find "${src_dir}" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) | while read -r lib; do
     if [[ -L "${lib}" ]]; then
-      cp -P "${lib}" "${dest}"
+      cp -P "${lib}" "${dest_dir}/"
     else
-      install -D -m 0755 "${lib}" "${dest}"
+      install -m 0755 "${lib}" "${dest_dir}/"
     fi
   done
-fi
+}
+
+_stage_libs libxrt2/usr/lib/x86_64-linux-gnu          ../staging/usr/lib/xrt/lib
+_stage_libs libxrt-npu2/usr/lib/x86_64-linux-gnu      ../staging/usr/lib/xrt/lib
+_stage_libs libxrt-npu2/usr/lib/x86_64-linux-gnu/xrt/module \
+                                                       ../staging/usr/lib/xrt/lib/xrt/module
 
 # Capture package versions for metadata
 rocm_ver_full=$(dpkg-deb -f rocm-smi-lib_*.deb Version 2>/dev/null || echo "${ROCM_VERSION}.unknown")
-xrt_ver_full=$(dpkg-deb  -f xrt_*.deb         Version 2>/dev/null || echo "unknown")
+xrt_ver_full=$(dpkg-deb  -f libxrt-utils_*.deb Version 2>/dev/null || echo "unknown")
 
 popd > /dev/null
 
