@@ -71,6 +71,9 @@ main() {
   install -m 0644 "${tmp_dir}/payload/${raw_file}" "${SYSEXT_DIR}/${raw_file}"
   echo "Installed: ${SYSEXT_DIR}/${raw_file}"
 
+  # Enable the service so extensions are auto-merged on every boot.
+  systemctl enable systemd-sysext 2>/dev/null || true
+
   if [[ "${MERGE}" == "1" ]]; then
     systemd-sysext merge
     echo ""

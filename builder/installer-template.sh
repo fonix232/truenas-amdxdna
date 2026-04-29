@@ -87,6 +87,9 @@ main() {
   install -m 0644 "${tmp_dir}/payload/${module_raw}"   "${SYSEXT_DIR}/${module_raw}"
   install -m 0644 "${tmp_dir}/payload/${firmware_raw}" "${SYSEXT_DIR}/${firmware_raw}"
 
+  # Enable the service so extensions are auto-merged on every boot.
+  systemctl enable systemd-sysext 2>/dev/null || true
+
   # Merge all extensions from /var/lib/extensions (a standard sysext search path).
   systemd-sysext merge
 
