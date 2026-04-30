@@ -65,14 +65,17 @@ main() {
   }
   trap '_cleanup' EXIT
 
-  # Extract the bundle embedded in this self-extracting file
+  # Extract the bundle embedded in this self-extracting file.
   mkdir -p "${tmp_dir}/payload"
   tail -n +"${PAYLOAD_LINE}" "$0" | tar -xz -C "${tmp_dir}/payload"
+
   if [[ ! -f "${tmp_dir}/payload/${module_raw}" ]]; then
     echo "ERROR: no module sysext for kernel '${running_krel}' in this bundle" >&2
     echo "Available module images:" >&2
     find "${tmp_dir}/payload" -name 'amdxdna-*.raw' ! -name 'amdxdna-firmware.raw' \
-      -printf '  %f\n' >&2 || true
+      -printf '  %f\n' >&2 2>/dev/null || \
+      ls "${tmp_dir}/payload"/amdxdna-*.raw 2>/dev/null | \
+        grep -v 'amdxdna-firmware' | xargs -I{} basename {} | sed 's/^/  /' >&2 || true
     exit 1
   fi
   [[ -f "${tmp_dir}/payload/${firmware_raw}" ]] \
