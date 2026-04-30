@@ -66,7 +66,7 @@ jobs:
 
       - name: Restore firmware sysext from cache
         id: cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v7
         with:
           path: amdxdna-firmware-${{ steps.head.outputs.fw_commit_short }}.raw
           key: amdxdna-firmware-raw-${{ steps.head.outputs.fw_commit }}
@@ -85,7 +85,7 @@ jobs:
 
       - name: Save firmware sysext to cache
         if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v7
         with:
           path: amdxdna-firmware-${{ steps.head.outputs.fw_commit_short }}.raw
           key: amdxdna-firmware-raw-${{ steps.head.outputs.fw_commit }}
@@ -135,7 +135,7 @@ jobs:
 
       - name: Restore rocm-tools sysext from cache
         id: cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v7
         with:
           path: rocm-tools/out/rocm-tools-*.raw
           key: ${{ steps.ver.outputs.cache_key }}
@@ -158,7 +158,7 @@ jobs:
 
       - name: Save rocm-tools sysext to cache
         if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v7
         with:
           path: rocm-tools/out/rocm-tools-*.raw
           key: ${{ steps.ver.outputs.cache_key }}
@@ -183,7 +183,7 @@ jobs:
 
       - name: Restore kernel headers from cache
         id: cache-kernel
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v7
         with:
           path: kernel-src
           key: truenas-kernel-headers-${{ matrix.kernel.kernel_sha }}-${{ matrix.mode }}-v11
@@ -214,7 +214,7 @@ jobs:
 
       - name: Save kernel headers to cache
         if: steps.cache-kernel.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v7
         with:
           path: kernel-src
           key: truenas-kernel-headers-${{ matrix.kernel.kernel_sha }}-${{ matrix.mode }}-v11
@@ -248,7 +248,7 @@ jobs:
             libelf-dev libssl-dev make squashfs-tools
 
       - name: Restore kernel headers from cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v7
         with:
           path: kernel-src
           key: truenas-kernel-headers-${{ matrix.kernel.kernel_sha }}-${{ matrix.mode }}-v11
@@ -294,7 +294,7 @@ jobs:
             src/amdxdna-dkms/drivers/accel/amdxdna/amdxdna.ko
 
       - name: Cache module sysext image
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v7
         with:
           path: |
             amdxdna-*.raw
@@ -326,7 +326,7 @@ jobs:
 
       # ── Restore firmware .raw ──────────────────────────────────────────────
       - name: Restore firmware sysext from cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v7
         with:
           path: amdxdna-firmware-${{ needs.build-firmware.outputs.fw_commit_short }}.raw
           key: amdxdna-firmware-raw-${{ needs.build-firmware.outputs.fw_commit }}
@@ -334,14 +334,14 @@ jobs:
 
       # ── Restore rocm-tools .raw ────────────────────────────────────────────
       - name: Restore rocm-tools sysext from cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v7
         with:
           path: rocm-tools/out/rocm-tools-*.raw
           key: ${{ needs.build-rocm-tools.outputs.cache_key }}
           fail-on-cache-miss: true
 
       # ── Restore per-kernel module .raw from cache (one step per matrix entry × mode) ──
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v7
         with:
           path: |
             amdxdna-*.raw
@@ -350,7 +350,7 @@ jobs:
           key: amdxdna-raw-${{ github.run_id }}-TS-26.0.0-BETA.1-production
           fail-on-cache-miss: true
 
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v7
         with:
           path: |
             amdxdna-*.raw
@@ -359,7 +359,7 @@ jobs:
           key: amdxdna-raw-${{ github.run_id }}-TS-26.0.0-BETA.1-debug
           fail-on-cache-miss: true
 
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v7
         with:
           path: |
             amdxdna-*.raw
@@ -368,7 +368,7 @@ jobs:
           key: amdxdna-raw-${{ github.run_id }}-truenas-linux-6.18-production
           fail-on-cache-miss: false
 
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v7
         with:
           path: |
             amdxdna-*.raw
@@ -394,7 +394,13 @@ jobs:
           BUILD_SHA:     ${{ github.sha }}
         working-directory: rocm-tools
         run: bash builder/assemble_run.sh
-
+      # ── Assemble amdnpu-firmware .run ──────────────────────────────────────────
+      - name: Assemble amdnpu-firmware .run installer
+        env:
+          BUILD_RUN_ID:     ${{ github.run_id }}
+          BUILD_SHA:        ${{ github.sha }}
+          FW_COMMIT_SHORT:  ${{ needs.build-firmware.outputs.fw_commit_short }}
+        run: bash builder/assemble_firmware_run.sh
       # ── Read final versions for release body ──────────────────────────────
       - name: Read xdna version
         id: ver
@@ -402,19 +408,27 @@ jobs:
 
       # ── Upload each .run as its own individual artifact ───────────────────
       - name: Upload amdxdna-override .run
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: amdxdna-override-${{ steps.ver.outputs.xdna_ver }}
           path: out/amdxdna-override-${{ steps.ver.outputs.xdna_ver }}.run
-          compression-level: 0
+          archive: false
           retention-days: 30
 
       - name: Upload rocm-tools .run
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rocm-tools-${{ needs.build-rocm-tools.outputs.rocm_version }}
           path: out/rocm-tools-*.run
-          compression-level: 0
+          archive: false
+          retention-days: 30
+
+      - name: Upload amdnpu-firmware .run
+        uses: actions/upload-artifact@v7
+        with:
+          name: amdnpu-firmware-${{ needs.build-firmware.outputs.fw_commit_short }}
+          path: out/amdnpu-firmware-${{ needs.build-firmware.outputs.fw_commit_short }}.run
+          archive: false
           retention-days: 30
 
       # ── GitHub Release (main branch pushes only) ──────────────────────────
@@ -457,4 +471,10 @@ jobs:
             bash rocm-tools-${{ needs.build-rocm-tools.outputs.rocm_version }}.run
             ```
             Provides `/usr/bin/rocm-smi` and `/usr/bin/xrt-smi` via `systemd-sysext`.
+
+            ## Update AMD NPU firmware only
+            ```bash
+            bash amdnpu-firmware-${{ needs.build-firmware.outputs.fw_commit_short }}.run
+            ```
+            Installs just the firmware sysext without touching kernel modules.
           files: out/*.run
