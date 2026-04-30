@@ -30,7 +30,7 @@ jobs:
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build matrix from kernels.json
         id: set
@@ -52,7 +52,7 @@ jobs:
       fw_commit:   ${{ steps.head.outputs.fw_commit }}
       fw_commit_short: ${{ steps.head.outputs.fw_commit_short }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Get linux-firmware HEAD commit
         id: head
@@ -102,7 +102,7 @@ jobs:
       xrt_version:  ${{ steps.ver.outputs.xrt_version }}
       cache_key:    ${{ steps.ver.outputs.cache_key }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Resolve ROCm version
         id: resolve
@@ -179,7 +179,7 @@ jobs:
         mode: [production, debug]
     name: "headers / ${{ matrix.kernel.truenas_tag }} / ${{ matrix.mode }}"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Restore kernel headers from cache
         id: cache-kernel
@@ -238,7 +238,7 @@ jobs:
       xdna_version: ${{ steps.build_ko.outputs.xdna_version }}
       xrt_version:  ${{ steps.xrt_ver.outputs.xrt_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install build + packaging dependencies
         run: |
@@ -317,7 +317,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install packaging dependencies
         run: |

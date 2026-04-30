@@ -33,7 +33,7 @@ raw=$(ls out/rocm-tools-*.raw 2>/dev/null | head -1)
 raw_file=$(basename "${raw}")
 rocm_ver=$(echo "${raw_file}" | sed 's/^rocm-tools-//; s/\.raw$//')
 
-cp "${raw}" work/bundle/
+cp "${raw}" work/bundle/rocm-tools.raw
 
 {
   printf 'ROCM_VERSION=%s\n'   "${ROCM_VERSION}"
