@@ -66,7 +66,7 @@ jobs:
 
       - name: Restore firmware sysext from cache
         id: cache
-        uses: actions/cache/restore@v7
+        uses: actions/cache/restore@v5
         with:
           path: amdxdna-firmware-${{ steps.head.outputs.fw_commit_short }}.raw
           key: amdxdna-firmware-raw-${{ steps.head.outputs.fw_commit }}
@@ -85,7 +85,7 @@ jobs:
 
       - name: Save firmware sysext to cache
         if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v7
+        uses: actions/cache/save@v5
         with:
           path: amdxdna-firmware-${{ steps.head.outputs.fw_commit_short }}.raw
           key: amdxdna-firmware-raw-${{ steps.head.outputs.fw_commit }}
@@ -135,7 +135,7 @@ jobs:
 
       - name: Restore rocm-tools sysext from cache
         id: cache
-        uses: actions/cache/restore@v7
+        uses: actions/cache/restore@v5
         with:
           path: rocm-tools/out/rocm-tools-*.raw
           key: ${{ steps.ver.outputs.cache_key }}
@@ -158,7 +158,7 @@ jobs:
 
       - name: Save rocm-tools sysext to cache
         if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v7
+        uses: actions/cache/save@v5
         with:
           path: rocm-tools/out/rocm-tools-*.raw
           key: ${{ steps.ver.outputs.cache_key }}
@@ -183,7 +183,7 @@ jobs:
 
       - name: Restore kernel headers from cache
         id: cache-kernel
-        uses: actions/cache/restore@v7
+        uses: actions/cache/restore@v5
         with:
           path: kernel-src
           key: truenas-kernel-headers-${{ matrix.kernel.kernel_sha }}-${{ matrix.mode }}-v11
@@ -214,7 +214,7 @@ jobs:
 
       - name: Save kernel headers to cache
         if: steps.cache-kernel.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v7
+        uses: actions/cache/save@v5
         with:
           path: kernel-src
           key: truenas-kernel-headers-${{ matrix.kernel.kernel_sha }}-${{ matrix.mode }}-v11
@@ -248,7 +248,7 @@ jobs:
             libelf-dev libssl-dev make squashfs-tools
 
       - name: Restore kernel headers from cache
-        uses: actions/cache/restore@v7
+        uses: actions/cache/restore@v5
         with:
           path: kernel-src
           key: truenas-kernel-headers-${{ matrix.kernel.kernel_sha }}-${{ matrix.mode }}-v11
@@ -294,7 +294,7 @@ jobs:
             src/amdxdna-dkms/drivers/accel/amdxdna/amdxdna.ko
 
       - name: Cache module sysext image
-        uses: actions/cache/save@v7
+        uses: actions/cache/save@v5
         with:
           path: |
             amdxdna-*.raw
@@ -326,7 +326,7 @@ jobs:
 
       # ── Restore firmware .raw ──────────────────────────────────────────────
       - name: Restore firmware sysext from cache
-        uses: actions/cache/restore@v7
+        uses: actions/cache/restore@v5
         with:
           path: amdxdna-firmware-${{ needs.build-firmware.outputs.fw_commit_short }}.raw
           key: amdxdna-firmware-raw-${{ needs.build-firmware.outputs.fw_commit }}
@@ -334,14 +334,14 @@ jobs:
 
       # ── Restore rocm-tools .raw ────────────────────────────────────────────
       - name: Restore rocm-tools sysext from cache
-        uses: actions/cache/restore@v7
+        uses: actions/cache/restore@v5
         with:
           path: rocm-tools/out/rocm-tools-*.raw
           key: ${{ needs.build-rocm-tools.outputs.cache_key }}
           fail-on-cache-miss: true
 
       # ── Restore per-kernel module .raw from cache (one step per matrix entry × mode) ──
-      - uses: actions/cache/restore@v7
+      - uses: actions/cache/restore@v5
         with:
           path: |
             amdxdna-*.raw
@@ -350,7 +350,7 @@ jobs:
           key: amdxdna-raw-${{ github.run_id }}-TS-26.0.0-BETA.1-production
           fail-on-cache-miss: true
 
-      - uses: actions/cache/restore@v7
+      - uses: actions/cache/restore@v5
         with:
           path: |
             amdxdna-*.raw
@@ -359,7 +359,7 @@ jobs:
           key: amdxdna-raw-${{ github.run_id }}-TS-26.0.0-BETA.1-debug
           fail-on-cache-miss: true
 
-      - uses: actions/cache/restore@v7
+      - uses: actions/cache/restore@v5
         with:
           path: |
             amdxdna-*.raw
@@ -368,7 +368,7 @@ jobs:
           key: amdxdna-raw-${{ github.run_id }}-truenas-linux-6.18-production
           fail-on-cache-miss: false
 
-      - uses: actions/cache/restore@v7
+      - uses: actions/cache/restore@v5
         with:
           path: |
             amdxdna-*.raw
