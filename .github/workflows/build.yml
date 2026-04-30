@@ -168,9 +168,9 @@ jobs:
           rustup component add rust-src rustfmt
           cargo install --locked bindgen-cli --version 0.72.1
 
-      - name: Cache prepared kernel headers
+      - name: Restore kernel headers from cache
         id: cache-kernel
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
         with:
           path: kernel-src
           key: truenas-kernel-headers-${{ matrix.kernel.kernel_sha }}-${{ matrix.mode }}-v11
@@ -181,6 +181,13 @@ jobs:
           KERNEL_SOURCE_REF: ${{ matrix.kernel.truenas_tag }}
           BUILD_MODE: ${{ matrix.mode }}
         run: bash builder/2_prepare_headers.sh
+
+      - name: Save kernel headers to cache
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: kernel-src
+          key: truenas-kernel-headers-${{ matrix.kernel.kernel_sha }}-${{ matrix.mode }}-v11
 
   # ---------------------------------------------------------------------------
   # Job 4: build
@@ -294,15 +301,16 @@ jobs:
             modules
           [[ -f "${drv_src}/amdxdna.ko" ]] || { echo "ERROR: amdxdna.ko not found" >&2; exit 1; }
 
-          # Stage the .ko and AMDXDNA_VERSION into a flat dir for caching
-          mkdir -p ko-staging
-          cp "${drv_src}/amdxdna.ko" ko-staging/
-          echo "${xdna_modver}" > ko-staging/module_version.txt
+          # Stage into the destination-named dir so cache restore lands in the right place
+          ko_dest="amdxdna-ko-${{ matrix.kernel.slug }}-${{ matrix.mode }}"
+          mkdir -p "${ko_dest}"
+          cp "${drv_src}/amdxdna.ko" "${ko_dest}/"
+          echo "${xdna_modver}" > "${ko_dest}/module_version.txt"
 
       - name: Cache kernel module
         uses: actions/cache/save@v5
         with:
-          path: ko-staging/
+          path: amdxdna-ko-${{ matrix.kernel.slug }}-${{ matrix.mode }}/
           key: amdxdna-ko-${{ github.run_id }}-${{ matrix.kernel.slug }}-${{ matrix.mode }}
 
   # ---------------------------------------------------------------------------
@@ -349,19 +357,11 @@ jobs:
           echo "xrt_version=${xrt_ver}" >> "$GITHUB_OUTPUT"
           echo "XRT version: ${xrt_ver}"
 
-      - name: Assemble sysext image and .run installer
-        env:
-          BUILD_RUN_ID: ${{ github.run_id }}
-          BUILD_SHA:    ${{ github.sha }}
-        working-directory: rocm-tools
-        run: bash builder/2_package.sh
-
-      - uses: actions/upload-artifact@v7
+      - name: Cache rocm-tools staging
+        uses: actions/cache/save@v5
         with:
-          name: rocm-tools-sysext
-          path: rocm-tools/out/*.run
-          archive: false
-          retention-days: 30
+          path: rocm-tools/staging/
+          key: rocm-tools-staging-${{ github.run_id }}
 
   # ---------------------------------------------------------------------------
   # Job 6: package
@@ -392,36 +392,36 @@ jobs:
           key: amdxdna-firmware-${{ needs.build-firmware.outputs.fw_commit }}
           fail-on-cache-miss: true
 
-      # The build job saves each .ko dir to cache with key amdxdna-ko-{run_id}-{slug}-{mode}.
-      # We restore them here by calling the GHA cache service directly via the
-      # ACTIONS_CACHE_URL + ACTIONS_RUNTIME_TOKEN env vars that every runner exposes.
-      - name: Restore kernel modules from cache
-        env:
-          MATRIX: ${{ needs.prepare-matrix.outputs.matrix }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          sudo apt-get install -y --no-install-recommends curl jq >/dev/null 2>&1 || true
-          echo "${MATRIX}" | jq -r '.[] | (.truenas_tag | gsub("/"; "-"))' | while read -r slug; do
-            for mode in production debug; do
-              cache_key="amdxdna-ko-${RUN_ID}-${slug}-${mode}"
-              dest="amdxdna-ko-${slug}-${mode}"
-              echo "Restoring ${cache_key} -> ${dest}/"
+      - uses: actions/cache/restore@v5
+        with:
+          path: amdxdna-ko-TS-26.0.0-BETA.1-production/
+          key: amdxdna-ko-${{ github.run_id }}-TS-26.0.0-BETA.1-production
+          fail-on-cache-miss: true
 
-              # Query the cache service for an archive URL
-              response=$(curl -fsSL \
-                -H "Accept: application/json;api-version=6.0-preview.1" \
-                -H "Authorization: Bearer ${ACTIONS_RUNTIME_TOKEN}" \
-                "${ACTIONS_CACHE_URL}_apis/artifactcache/cache?keys=${cache_key}&version=$(echo -n "${cache_key}" | sha256sum | cut -d' ' -f1)")
-              archive_url=$(echo "${response}" | jq -r '.archiveLocation // empty')
-              [[ -n "${archive_url}" ]] \
-                || { echo "ERROR: cache entry not found for ${cache_key}" >&2; exit 1; }
+      - uses: actions/cache/restore@v5
+        with:
+          path: amdxdna-ko-TS-26.0.0-BETA.1-debug/
+          key: amdxdna-ko-${{ github.run_id }}-TS-26.0.0-BETA.1-debug
+          fail-on-cache-miss: true
 
-              mkdir -p "${dest}"
-              curl -fsSL "${archive_url}" \
-                | tar -xz -C "${dest}" --strip-components=1
-              echo "  -> restored: $(ls ${dest})"
-            done
-          done
+      - uses: actions/cache/restore@v5
+        with:
+          path: amdxdna-ko-truenas-linux-6.18-production/
+          key: amdxdna-ko-${{ github.run_id }}-truenas-linux-6.18-production
+          fail-on-cache-miss: false
+
+      - uses: actions/cache/restore@v5
+        with:
+          path: amdxdna-ko-truenas-linux-6.18-debug/
+          key: amdxdna-ko-${{ github.run_id }}-truenas-linux-6.18-debug
+          fail-on-cache-miss: false
+
+      - name: Restore rocm-tools staging from cache
+        uses: actions/cache/restore@v5
+        with:
+          path: rocm-tools/staging/
+          key: rocm-tools-staging-${{ github.run_id }}
+          fail-on-cache-miss: true
 
       - name: Assemble all sysext images and .run installer
         env:
@@ -431,18 +431,21 @@ jobs:
           AMDXDNA_VERSION: ${{ needs.build.outputs.xdna_version }}
         run: bash builder/3_package.sh
 
+      - name: Build rocm-tools .run installer
+        env:
+          BUILD_RUN_ID: ${{ github.run_id }}
+          BUILD_SHA:    ${{ github.sha }}
+        working-directory: rocm-tools
+        run: |
+          bash builder/2_package.sh
+          cp out/*.run "${GITHUB_WORKSPACE}/out/"
+
       - uses: actions/upload-artifact@v7
         with:
-          name: amdxdna-sysext
+          name: sysext-packages
           path: out/*.run
-          archive: false
+          compression-level: 0
           retention-days: 30
-
-      - name: Download rocm-tools artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: rocm-tools-sysext
-          path: out/
 
       - name: Read xdna version
         id: ver
