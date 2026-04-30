@@ -41,7 +41,7 @@ modes are built automatically.
   {
     "base_version": "6.18.13",
     "truenas_tag":  "TS-26.0.0-BETA.1",
-    "dkms_ref":     "main"
+    "xdna_ref":     "main"
   }
 ]
 ```
@@ -49,8 +49,9 @@ modes are built automatically.
 | Field | Required | Description |
 |---|---|---|
 | `base_version` | yes | Kernel version number (e.g. `6.18.13`) |
-| `truenas_tag` | yes | Git tag on [truenas/linux](https://github.com/truenas/linux) |
-| `dkms_ref` | no | Branch/tag on amd/xdna-driver — defaults to `main` |
+| `truenas_tag` | yes | Git tag **or branch name** on [truenas/linux](https://github.com/truenas/linux) |
+| `xdna_ref` | no | Branch/tag on amd/xdna-driver — defaults to `main` |
+| `nightly` | no | If `true`, only built on scheduled runs or when `include_nightly` is set — defaults to `false` |
 
 The full kernel release string `<base_version>-<mode>+truenas` is computed
 automatically. Both `production` and `debug` are always built (their vermagic
@@ -69,8 +70,12 @@ Five jobs, all re-runnable independently:
 | `package` | ubuntu-24.04 | Assemble all .raw images + single .run; re-run alone after installer changes |
 
 Caches are keyed to avoid redundant work:
-- Kernel headers: `truenas-kernel-headers-{tag}-{mode}-v11`
+- Kernel headers: `truenas-kernel-headers-{kernel_sha}-{mode}-v11` (SHA resolved from tag or branch HEAD)
 - Firmware: `amdxdna-firmware-{linux-firmware HEAD SHA}`
+
+Nightly builds use branch refs (e.g. `linux-6.18`) instead of tags. The SHA
+resolution in `prepare-matrix` ensures the kernel-headers cache correctly
+invalidates when the branch advances.
 
 To build a single release via `workflow_dispatch`, enter the `truenas_tag`
 value (e.g. `TS-26.0.0-BETA.1`) in the **single_version** input.

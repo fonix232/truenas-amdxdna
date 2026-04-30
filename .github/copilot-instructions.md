@@ -60,14 +60,14 @@ loads the module via `systemd-sysext merge` + `depmod` + `modprobe`.
   {
     "base_version": "6.18.13",
     "truenas_tag":  "TS-26.0.0-BETA.1",
-    "dkms_ref":     "main"
+    "xdna_ref":     "main"
   }
 ]
 ```
 
 - `base_version`: the numeric kernel version string (no suffix)
 - `truenas_tag`: git tag on `truenas/linux` — format is `TS-<truenas-version>`
-- `dkms_ref`: optional branch/tag on `amd/xdna-driver`; defaults to `"main"`
+- `xdna_ref`: optional branch/tag on `amd/xdna-driver`; defaults to `"main"`
 
 Mode (`production`/`debug`) is a fixed matrix axis in the workflow — both are
 always built. `kernel_version` is computed as `<base_version>-<mode>+truenas`.

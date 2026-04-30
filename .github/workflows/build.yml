@@ -22,7 +22,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # Job 1: prepare-matrix
   # Reads kernels.json and emits a matrix of {truenas_tag, base_version,
-  # dkms_ref, kernel_sha}. Mode (production/debug) is added as a separate
+  # xdna_ref, kernel_sha}. Mode (production/debug) is added as a separate
   # matrix axis in each downstream job.
   #
   # kernel_sha: resolved HEAD SHA for each truenas_tag.  For immutable tags
@@ -46,7 +46,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INCLUDE_NIGHTLY: ${{ inputs.include_nightly }}
         run: |
-          expanded=$(jq -c '[.[] | {base_version: (.base_version // ""), truenas_tag, slug: (.truenas_tag | gsub("/"; "-")), dkms_ref: (.dkms_ref // "main"), nightly: (.nightly // false)}]' kernels.json)
+          expanded=$(jq -c '[.[] | {base_version: (.base_version // ""), truenas_tag, slug: (.truenas_tag | gsub("/"; "-")), xdna_ref: (.xdna_ref // "main"), nightly: (.nightly // false)}]' kernels.json)
 
           # Nightly (branch-based) entries are only built on schedule or when
           # explicitly requested via workflow_dispatch.
@@ -185,8 +185,8 @@ jobs:
   # ---------------------------------------------------------------------------
   # Job 4: build
   # Restores kernel headers from cache, clones xdna-driver, generates
-  # config_kernel.h, compiles amdxdna.ko. Uploads the .ko as an artifact
-  # for the downstream package job. No firmware dependency here.
+  # config_kernel.h, compiles amdxdna.ko. Saves the .ko to cache (keyed by
+  # run_id+slug+mode) for the downstream package job. No firmware dependency here.
   # Matrix: kernels × {production, debug}
   # ---------------------------------------------------------------------------
   build:
@@ -199,6 +199,11 @@ jobs:
         mode: [production, debug]
 
     name: "build / ${{ matrix.kernel.truenas_tag }} / ${{ matrix.mode }}"
+
+    outputs:
+      # All matrix entries build from the same xdna-driver ref, so any
+      # instance's version is representative. GitHub uses the last to complete.
+      xdna_version: ${{ steps.build_ko.outputs.xdna_version }}
 
     steps:
       - name: Install build dependencies
@@ -215,52 +220,90 @@ jobs:
           key: truenas-kernel-headers-${{ matrix.kernel.kernel_sha }}-${{ matrix.mode }}-v11
           fail-on-cache-miss: true
 
-      - name: Fetch amdxdna-dkms source
+      - name: Clone xdna-driver
+        env:
+          XDNA_REF: ${{ matrix.kernel.xdna_ref }}
         run: |
-          # Download the lemonade-team dkms source package directly from the
-          # XRT PPA. This gives us a proper PACKAGE_VERSION (7.0.0-rc1+...)
-          # that becomes the MODULE_VERSION string, so tools like flm validate
-          # accept the module. We extract from the .deb without adding the
-          # noble PPA to the build runner (ubuntu-22.04).
-          DKMS_DEB="https://ppa.launchpadcontent.net/amd-team/xrt/ubuntu/pool/main/a/amdxdna-dkms/amdxdna-dkms_7.0.0-rc1+git20260310.6b13cb8f4-noble1_amd64.deb"
-          wget -q "${DKMS_DEB}" -O /tmp/amdxdna-dkms.deb
-          dpkg-deb -x /tmp/amdxdna-dkms.deb /tmp/amdxdna-dkms-extracted/
-          mkdir -p src
-          SRCDIR=$(find /tmp/amdxdna-dkms-extracted/usr/src/ -maxdepth 1 -mindepth 1 -type d | head -1)
-          ln -s "${SRCDIR}" src/amdxdna-dkms
-          echo "Using dkms source: ${SRCDIR}"
+          git clone --depth 1 --branch "${XDNA_REF}" \
+            https://github.com/amd/xdna-driver src/amdxdna-dkms || \
+          git clone --depth 1 https://github.com/amd/xdna-driver src/amdxdna-dkms
 
-      - name: Build amdxdna.ko
+      - name: Generate config_kernel.h
         env:
           KERNEL_VERSION: ${{ matrix.kernel.base_version }}-${{ matrix.mode }}+truenas
         run: |
-          # The lemonade-team dkms source is flat: all .c files directly in
-          # the package dir (no drivers/accel/amdxdna/ subdirectory).
-          drv_src="src/amdxdna-dkms"
+          drv_src="src/amdxdna-dkms/drivers/accel/amdxdna"
+          KERNEL_SRC="${GITHUB_WORKSPACE}/kernel-src" \
+            KERNEL_VER="${KERNEL_VERSION}" \
+            KBUILD_MODPOST_WARN=1 \
+            KCFLAGS="-Wno-unused-variable" \
+            OUT="${drv_src}/config_kernel.h" \
+            bash "src/amdxdna-dkms/drivers/accel/tools/configure_kernel.sh"
+
+      - name: Build amdxdna.ko
+        id: build_ko
+        env:
+          KERNEL_VERSION: ${{ matrix.kernel.base_version }}-${{ matrix.mode }}+truenas
+        run: |
+          drv_src="src/amdxdna-dkms/drivers/accel/amdxdna"
           drv_c="${drv_src}/amdxdna_pci_drv.c"
 
-          # Extract PACKAGE_VERSION from dkms.conf and inject MODULE_VERSION.
-          # The lemonade-team source has no MODULE_VERSION() in the C file;
-          # we append it so that tools like flm validate see the correct string.
-          xdna_modver=$(grep '^PACKAGE_VERSION=' "${drv_src}/dkms.conf" \
-            | sed 's/PACKAGE_VERSION="\(.*\)"/\1/')
-          sed -i '/^MODULE_DESCRIPTION/a MODULE_VERSION("'"${xdna_modver}"'");' "${drv_c}"
-          echo "Injected MODULE_VERSION(\"${xdna_modver}\")"
-          echo "${xdna_modver}" > "${drv_src}/module_version.txt"
+          # Remove stale MODULE_VERSION() — FLM reads the driver version via
+          # DRM_IOCTL_VERSION (drm_driver.major/minor), not from module metadata.
+          # Keeping the hardcoded "0.1" string would shadow the correct 0.10
+          # that the drm_driver struct already advertises at runtime.
+          sed -i '/^MODULE_VERSION(/d' "${drv_c}"
+
+          # Write module_version.txt from the actual MAJOR.MINOR defines so the
+          # package job and release tag reflect what FLM really sees.
+          xdna_major=$(grep -m1 'define[[:space:]]\+AMDXDNA_DRIVER_MAJOR' "${drv_c}" | grep -oP '\d+$')
+          xdna_minor=$(grep -m1 'define[[:space:]]\+AMDXDNA_DRIVER_MINOR' "${drv_c}" | grep -oP '\d+$')
+          xdna_modver="${xdna_major}.${xdna_minor}"
+          echo "AMDXDNA_VERSION=${xdna_modver}" >> "$GITHUB_ENV"
+          echo "xdna_version=${xdna_modver}" >> "$GITHUB_OUTPUT"
+          echo "Driver version: ${xdna_modver}"
+
+          # Fix: amdxdna_sva_fini must be called before mmdrop(client->mm).
+          # When FLM terminates dirty (SIGKILL / container stop), mm_users has
+          # already reached zero by the time DRM close runs. mmdrop then drops
+          # mm_count to zero and frees mm_struct, so the subsequent
+          # iommu_sva_unbind_device call traverses freed mm IOMMU SVA list
+          # entries, triggering a general protection fault (kernel panic).
+          # Swapping the two calls keeps the mm alive across the SVA unbind.
+          awk '
+            /^static void amdxdna_client_cleanup\(/ { in_fn = 1 }
+            in_fn && /^\}/ { in_fn = 0 }
+            in_fn && /^[[:space:]]+mmdrop\(client->mm\);/ {
+              hold = $0; getline nxt
+              if (nxt ~ /^[[:space:]]+amdxdna_sva_fini\(client\);/) {
+                print nxt; print hold; next
+              }
+              print hold
+              $0 = nxt
+            }
+            { print }
+          ' "${drv_c}" > "${drv_c}.tmp" && mv "${drv_c}.tmp" "${drv_c}"
+          grep -q 'amdxdna_sva_fini(client)' "${drv_c}" \
+            || { echo "ERROR: SVA ordering patch was not applied to ${drv_c}" >&2; exit 1; }
+          echo "Applied amdxdna_client_cleanup SVA-before-mmdrop fix"
 
           KBUILD_MODPOST_WARN=1 make -C "${GITHUB_WORKSPACE}/kernel-src" \
             M="${GITHUB_WORKSPACE}/${drv_src}" \
+            CFLAGS_MODULE="-DAMDXDNA_DEVEL" \
+            OFT_CONFIG_AMDXDNA_PCI=y \
             modules
           [[ -f "${drv_src}/amdxdna.ko" ]] || { echo "ERROR: amdxdna.ko not found" >&2; exit 1; }
 
-      - name: Upload kernel module artifact
-        uses: actions/upload-artifact@v7
+          # Stage the .ko and AMDXDNA_VERSION into a flat dir for caching
+          mkdir -p ko-staging
+          cp "${drv_src}/amdxdna.ko" ko-staging/
+          echo "${xdna_modver}" > ko-staging/module_version.txt
+
+      - name: Cache kernel module
+        uses: actions/cache/save@v5
         with:
-          name: amdxdna-ko-${{ matrix.kernel.slug }}-${{ matrix.mode }}
-          path: |
-            src/amdxdna-dkms/amdxdna.ko
-            src/amdxdna-dkms/module_version.txt
-          retention-days: 7
+          path: ko-staging/
+          key: amdxdna-ko-${{ github.run_id }}-${{ matrix.kernel.slug }}-${{ matrix.mode }}
 
   # ---------------------------------------------------------------------------
   # Job 5: build-rocm-tools
@@ -275,6 +318,7 @@ jobs:
     name: "rocm-tools"
     outputs:
       rocm_version: ${{ steps.ver.outputs.rocm_version }}
+      xrt_version:  ${{ steps.xrt_ver.outputs.xrt_version }}
 
     steps:
       - uses: actions/checkout@v6
@@ -298,6 +342,13 @@ jobs:
         working-directory: rocm-tools
         run: bash builder/1_fetch_packages.sh
 
+      - name: Read XRT version
+        id: xrt_ver
+        run: |
+          xrt_ver=$(dpkg-query -W -f='${Version}' libxrt-npu2 2>/dev/null || echo "unknown")
+          echo "xrt_version=${xrt_ver}" >> "$GITHUB_OUTPUT"
+          echo "XRT version: ${xrt_ver}"
+
       - name: Assemble sysext image and .run installer
         env:
           BUILD_RUN_ID: ${{ github.run_id }}
@@ -309,6 +360,7 @@ jobs:
         with:
           name: rocm-tools-sysext
           path: rocm-tools/out/*.run
+          archive: false
           retention-days: 30
 
   # ---------------------------------------------------------------------------
@@ -340,24 +392,50 @@ jobs:
           key: amdxdna-firmware-${{ needs.build-firmware.outputs.fw_commit }}
           fail-on-cache-miss: true
 
-      # Downloads all amdxdna-ko-* artifacts, each into its own subdirectory
-      # named after the artifact (e.g. amdxdna-ko-TS-26.0.0-BETA.1-production/)
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: amdxdna-ko-*
-          merge-multiple: false
+      # The build job saves each .ko dir to cache with key amdxdna-ko-{run_id}-{slug}-{mode}.
+      # We restore them here by calling the GHA cache service directly via the
+      # ACTIONS_CACHE_URL + ACTIONS_RUNTIME_TOKEN env vars that every runner exposes.
+      - name: Restore kernel modules from cache
+        env:
+          MATRIX: ${{ needs.prepare-matrix.outputs.matrix }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          sudo apt-get install -y --no-install-recommends curl jq >/dev/null 2>&1 || true
+          echo "${MATRIX}" | jq -r '.[] | (.truenas_tag | gsub("/"; "-"))' | while read -r slug; do
+            for mode in production debug; do
+              cache_key="amdxdna-ko-${RUN_ID}-${slug}-${mode}"
+              dest="amdxdna-ko-${slug}-${mode}"
+              echo "Restoring ${cache_key} -> ${dest}/"
+
+              # Query the cache service for an archive URL
+              response=$(curl -fsSL \
+                -H "Accept: application/json;api-version=6.0-preview.1" \
+                -H "Authorization: Bearer ${ACTIONS_RUNTIME_TOKEN}" \
+                "${ACTIONS_CACHE_URL}_apis/artifactcache/cache?keys=${cache_key}&version=$(echo -n "${cache_key}" | sha256sum | cut -d' ' -f1)")
+              archive_url=$(echo "${response}" | jq -r '.archiveLocation // empty')
+              [[ -n "${archive_url}" ]] \
+                || { echo "ERROR: cache entry not found for ${cache_key}" >&2; exit 1; }
+
+              mkdir -p "${dest}"
+              curl -fsSL "${archive_url}" \
+                | tar -xz -C "${dest}" --strip-components=1
+              echo "  -> restored: $(ls ${dest})"
+            done
+          done
 
       - name: Assemble all sysext images and .run installer
         env:
           MATRIX: ${{ needs.prepare-matrix.outputs.matrix }}
           BUILD_RUN_ID: ${{ github.run_id }}
           BUILD_SHA: ${{ github.sha }}
+          AMDXDNA_VERSION: ${{ needs.build.outputs.xdna_version }}
         run: bash builder/3_package.sh
 
       - uses: actions/upload-artifact@v7
         with:
           name: amdxdna-sysext
           path: out/*.run
+          archive: false
           retention-days: 30
 
       - name: Download rocm-tools artifact
@@ -397,6 +475,7 @@ jobs:
             AMD XDNA kernel module + ROCm/XRT userspace tools sysext for TrueNAS SCALE.
 
             Built from [amd/xdna-driver](https://github.com/amd/xdna-driver) version ${{ steps.ver.outputs.xdna_ver }}.
+            ROCm ${{ needs.build-rocm-tools.outputs.rocm_version }}, XRT ${{ needs.build-rocm-tools.outputs.xrt_version }}.
 
             ## Install XDNA kernel module
             ```bash

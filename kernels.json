@@ -2,11 +2,11 @@
   {
     "base_version": "6.18.13",
     "truenas_tag": "TS-26.0.0-BETA.1",
-    "dkms_ref": "main"
+    "xdna_ref": "main"
   },
   {
     "truenas_tag": "truenas/linux-6.18",
-    "dkms_ref": "main",
+    "xdna_ref": "main",
     "nightly": true
   }
 ]
